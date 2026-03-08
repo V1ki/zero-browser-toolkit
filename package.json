@@ -1,0 +1,16 @@
+{
+  "name": "zero-browser-toolkit",
+  "private": true,
+  "version": "0.3.0",
+  "description": "Zero browser extension + local bridge toolkit",
+  "workspaces": [
+    "browser-gui-bridge"
+  ],
+  "scripts": {
+    "check": "bun run --cwd browser-gui-bridge check && node --check browser-zero-extension/background.js && node --check browser-zero-extension/popup.js",
+    "version:sync": "node scripts/sync-version.mjs",
+    "release:patch": "node scripts/bump-version.mjs patch",
+    "release:minor": "node scripts/bump-version.mjs minor",
+    "release:major": "node scripts/bump-version.mjs major"
+  }
+}

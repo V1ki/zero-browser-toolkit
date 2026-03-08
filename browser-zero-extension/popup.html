@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Zero Browser Context</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        width: 320px;
+        padding: 12px;
+      }
+      button {
+        width: 100%;
+        padding: 10px 12px;
+        border: 0;
+        border-radius: 8px;
+        background: #111827;
+        color: white;
+        cursor: pointer;
+      }
+      #status {
+        margin-top: 10px;
+        white-space: pre-wrap;
+        font-size: 12px;
+        color: #374151;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="send">Send page text to Zero</button>
+    <div id="status">Idle</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

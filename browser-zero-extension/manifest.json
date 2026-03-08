@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Zero Browser Context",
+  "version": "0.3.0",
+  "description": "Send current page text to local Zero bridge and receive commands.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:4318/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Send page to Zero",
+    "default_popup": "popup.html"
+  }
+}
