@@ -12,6 +12,7 @@ type Action =
   | 'getPageContext'
   | 'listTabs'
   | 'selectTab'
+  | 'eval'
 
 type BrowserName = 'Google Chrome' | 'Safari'
 
@@ -21,6 +22,7 @@ type ActionRequest = {
   browser?: BrowserName
   timeoutMs?: number
   tabId?: number | string
+  expression?: string
 }
 
 type PageLink = {
@@ -52,7 +54,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'listTabs' | 'selectTab'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'listTabs' | 'selectTab' | 'eval'
 
 type ExtensionCommand = {
   id: string
@@ -80,6 +82,7 @@ type ExtensionCommandResult = {
   tabId?: number
   windowId?: number
   tabs?: BrowserTab[]
+  value?: unknown
   error?: string
   timestamp?: string
 }
@@ -458,6 +461,22 @@ async function selectTab(tabId: number | string | undefined, timeoutMs = DEFAULT
   }
 }
 
+async function evalInPage(expression: string | undefined, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const source = String(expression ?? '').trim()
+  if (!source) throw new Error('Missing expression')
+
+  const result = await requestCommand('eval', { expression: source }, timeoutMs)
+  return {
+    ok: true,
+    via: 'extension-command-queue',
+    commandId: result.id,
+    tabId: result.tabId ?? null,
+    windowId: result.windowId ?? null,
+    value: result.value ?? null,
+    result,
+  }
+}
+
 async function handleAction(body: ActionRequest): Promise<JsonRecord> {
   const action = body.action
   const browser = body.browser ?? DEFAULT_BROWSER
@@ -494,6 +513,8 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return listTabs(body.timeoutMs)
     case 'selectTab':
       return selectTab(body.tabId, body.timeoutMs)
+    case 'eval':
+      return evalInPage(body.expression, body.timeoutMs)
     default:
       throw new Error(`Unsupported action: ${String(action)}`)
   }

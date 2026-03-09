@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Zero Browser Context",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Send current page text to local Zero bridge and receive commands.",
   "permissions": [
     "activeTab",

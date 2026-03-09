@@ -52,6 +52,20 @@ function toTabSummary(tab) {
   }
 }
 
+function serializeEvalValue(value) {
+  if (value === undefined) return { value: null, warnings: ['eval_returned_undefined'] }
+
+  try {
+    const normalized = JSON.parse(JSON.stringify(value))
+    return { value: normalized, warnings: [] }
+  } catch {
+    return {
+      value: String(value),
+      warnings: ['eval_value_stringified'],
+    }
+  }
+}
+
 async function listTabs() {
   const tabs = await chrome.tabs.query({})
   const activeTab = await getActiveTab()
@@ -79,6 +93,44 @@ async function selectTab(tabId) {
 
   const selected = await chrome.tabs.get(parsedTabId)
   return toTabSummary(selected)
+}
+
+async function runEval(tabId, expression) {
+  const source = String(expression ?? '').trim()
+  if (!source) throw new Error('Missing expression')
+
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [source],
+    func: async (rawExpression) => {
+      try {
+        const evaluator = new Function(`return (${rawExpression})`)
+        const output = await evaluator()
+        return {
+          ok: true,
+          ...(() => {
+            if (output === undefined) return { value: null, warnings: ['eval_returned_undefined'] }
+            try {
+              return { value: JSON.parse(JSON.stringify(output)), warnings: [] }
+            } catch {
+              return { value: String(output), warnings: ['eval_value_stringified'] }
+            }
+          })(),
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      }
+    },
+  })
+
+  const payload = result?.result
+  if (!payload) throw new Error('No eval result returned')
+  if (!payload.ok) throw new Error(payload.error ?? 'Eval failed')
+
+  return serializeEvalValue(payload.value)
 }
 
 async function extractPage(tabId) {
@@ -232,6 +284,22 @@ async function executeCommand(command) {
         windowId: selected.windowId,
         title: selected.title,
         url: selected.url,
+      }
+    }
+
+    case 'eval': {
+      const tab = await getActiveTab()
+      const evaluated = await runEval(tab.id, command.payload?.expression)
+      return {
+        id: command.id,
+        ok: true,
+        type: command.type,
+        tabId: tab.id,
+        windowId: tab.windowId,
+        title: tab.title ?? '',
+        url: tab.url ?? '',
+        value: evaluated.value,
+        warnings: evaluated.warnings,
       }
     }
 
