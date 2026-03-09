@@ -42,6 +42,45 @@ function collectWarnings({ bodyText, mainText, title }) {
   return warnings
 }
 
+function toTabSummary(tab) {
+  return {
+    id: tab.id,
+    windowId: tab.windowId,
+    active: Boolean(tab.active),
+    title: tab.title ?? '',
+    url: tab.url ?? '',
+  }
+}
+
+async function listTabs() {
+  const tabs = await chrome.tabs.query({})
+  const activeTab = await getActiveTab()
+  return {
+    tabId: activeTab.id,
+    windowId: activeTab.windowId,
+    tabs: tabs
+      .filter((tab) => typeof tab.id === 'number' && typeof tab.windowId === 'number')
+      .map(toTabSummary),
+  }
+}
+
+async function selectTab(tabId) {
+  const parsedTabId = Number(tabId)
+  if (!Number.isInteger(parsedTabId) || parsedTabId <= 0) throw new Error('Missing or invalid tabId')
+
+  const tab = await chrome.tabs.get(parsedTabId)
+  if (!tab?.id) throw new Error(`Tab not found: ${parsedTabId}`)
+
+  await chrome.tabs.update(parsedTabId, { active: true })
+  if (tab.windowId !== undefined) {
+    await chrome.windows.update(tab.windowId, { focused: true })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+
+  const selected = await chrome.tabs.get(parsedTabId)
+  return toTabSummary(selected)
+}
+
 async function extractPage(tabId) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
@@ -166,6 +205,33 @@ async function executeCommand(command) {
         type: command.type,
         url,
         title: tab.title ?? '',
+        tabId: tab.id,
+        windowId: tab.windowId,
+      }
+    }
+
+    case 'listTabs': {
+      const result = await listTabs()
+      return {
+        id: command.id,
+        ok: true,
+        type: command.type,
+        tabId: result.tabId,
+        windowId: result.windowId,
+        tabs: result.tabs,
+      }
+    }
+
+    case 'selectTab': {
+      const selected = await selectTab(command.payload?.tabId)
+      return {
+        id: command.id,
+        ok: true,
+        type: command.type,
+        tabId: selected.id,
+        windowId: selected.windowId,
+        title: selected.title,
+        url: selected.url,
       }
     }
 
@@ -178,6 +244,8 @@ async function executeCommand(command) {
         id: command.id,
         ok: true,
         type: command.type,
+        tabId: tab.id,
+        windowId: tab.windowId,
         url: page.url,
         title: page.title,
         readyState: page.readyState,
@@ -201,6 +269,8 @@ async function executeCommand(command) {
         id: command.id,
         ok: true,
         type: command.type,
+        tabId: tab.id,
+        windowId: tab.windowId,
         url: page.url,
         title: page.title,
         scrollY: page.scrollY,

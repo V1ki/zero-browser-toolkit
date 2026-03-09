@@ -10,6 +10,8 @@ type Action =
   | 'saveContext'
   | 'captureContext'
   | 'getPageContext'
+  | 'listTabs'
+  | 'selectTab'
 
 type BrowserName = 'Google Chrome' | 'Safari'
 
@@ -18,11 +20,20 @@ type ActionRequest = {
   url?: string
   browser?: BrowserName
   timeoutMs?: number
+  tabId?: number | string
 }
 
 type PageLink = {
   text: string
   href: string
+}
+
+type BrowserTab = {
+  id: number
+  windowId: number
+  active: boolean
+  title: string
+  url: string
 }
 
 type PageContextPayload = {
@@ -41,7 +52,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'listTabs' | 'selectTab'
 
 type ExtensionCommand = {
   id: string
@@ -66,6 +77,9 @@ type ExtensionCommandResult = {
   warnings?: string[]
   readyState?: string
   scrollY?: number
+  tabId?: number
+  windowId?: number
+  tabs?: BrowserTab[]
   error?: string
   timestamp?: string
 }
@@ -117,6 +131,14 @@ function timestampId(date = new Date()): string {
 
 function createCommandId(): string {
   return `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+function normalizeTabId(value: number | string | undefined): number {
+  const parsed = typeof value === 'number' ? value : Number(String(value ?? '').trim())
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error('Missing or invalid tabId')
+  }
+  return parsed
 }
 
 async function ensureDir(path: string): Promise<void> {
@@ -370,13 +392,17 @@ async function waitForCommandResult(commandId: string, timeoutMs = DEFAULT_COMMA
   throw new Error(`Timed out waiting for command result: ${commandId}`)
 }
 
-async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
-  const { command } = await enqueueCommand('getPageContext')
+async function requestCommand(type: CommandType, payload?: Record<string, unknown>, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<ExtensionCommandResult> {
+  const { command } = await enqueueCommand(type, payload)
   const result = await waitForCommandResult(command.id, timeoutMs)
-
   if (!result.ok) {
-    throw new Error(result.error ?? 'Failed to get page context')
+    throw new Error(result.error ?? `Failed to run command: ${type}`)
   }
+  return result
+}
+
+async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const result = await requestCommand('getPageContext', undefined, timeoutMs)
 
   const saved = await savePageContext({
     source: 'browser-extension',
@@ -397,10 +423,38 @@ async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<J
   return {
     ok: true,
     via: 'extension-command-queue',
-    commandId: command.id,
+    commandId: result.id,
     result,
     savedTo: saved.savedTo,
     pageContext: saved,
+  }
+}
+
+async function listTabs(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const result = await requestCommand('listTabs', undefined, timeoutMs)
+  return {
+    ok: true,
+    via: 'extension-command-queue',
+    commandId: result.id,
+    tabs: result.tabs ?? [],
+    activeTabId: result.tabId ?? null,
+    activeWindowId: result.windowId ?? null,
+    result,
+  }
+}
+
+async function selectTab(tabId: number | string | undefined, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const normalizedTabId = normalizeTabId(tabId)
+  const result = await requestCommand('selectTab', { tabId: normalizedTabId }, timeoutMs)
+  return {
+    ok: true,
+    via: 'extension-command-queue',
+    commandId: result.id,
+    tabId: result.tabId ?? normalizedTabId,
+    windowId: result.windowId ?? null,
+    title: result.title ?? '',
+    url: result.url ?? '',
+    result,
   }
 }
 
@@ -436,6 +490,10 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return saveContext(browser, true)
     case 'getPageContext':
       return getPageContext(body.timeoutMs)
+    case 'listTabs':
+      return listTabs(body.timeoutMs)
+    case 'selectTab':
+      return selectTab(body.tabId, body.timeoutMs)
     default:
       throw new Error(`Unsupported action: ${String(action)}`)
   }
