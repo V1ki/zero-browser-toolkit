@@ -9,6 +9,7 @@ type Action =
   | 'screenshotFrontWindow'
   | 'saveContext'
   | 'captureContext'
+  | 'getPageContext'
 
 type BrowserName = 'Google Chrome' | 'Safari'
 
@@ -16,6 +17,12 @@ type ActionRequest = {
   action?: Action
   url?: string
   browser?: BrowserName
+  timeoutMs?: number
+}
+
+type PageLink = {
+  text: string
+  href: string
 }
 
 type PageContextPayload = {
@@ -24,11 +31,17 @@ type PageContextPayload = {
   url?: string
   selectionText?: string
   bodyText?: string
+  mainText?: string
   html?: string
+  mainHtml?: string
+  links?: PageLink[]
+  meta?: Record<string, string>
+  warnings?: string[]
+  readyState?: string
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext'
 
 type ExtensionCommand = {
   id: string
@@ -43,8 +56,15 @@ type ExtensionCommandResult = {
   type?: CommandType
   url?: string
   title?: string
+  selectionText?: string
   bodyText?: string
+  mainText?: string
   html?: string
+  mainHtml?: string
+  links?: PageLink[]
+  meta?: Record<string, string>
+  warnings?: string[]
+  readyState?: string
   scrollY?: number
   error?: string
   timestamp?: string
@@ -78,6 +98,8 @@ const LATEST_CONTEXT_PATH = `${SHARED_DIR}/latest-context.json`
 const PAGE_CONTEXT_PATH = `${SHARED_DIR}/latest-page-context.json`
 const COMMAND_QUEUE_PATH = `${SHARED_DIR}/command-queue.json`
 const COMMAND_RESULT_PATH = `${SHARED_DIR}/latest-command-result.json`
+const DEFAULT_COMMAND_TIMEOUT_MS = Number(Bun.env.BROWSER_GUI_BRIDGE_COMMAND_TIMEOUT_MS ?? '15000')
+const COMMAND_POLL_INTERVAL_MS = 250
 
 const commandQueue: ExtensionCommand[] = []
 let latestCommandResult: ExtensionCommandResult | null = null
@@ -87,10 +109,6 @@ function json(data: JsonRecord, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
   })
-}
-
-function escapeAppleScriptString(input: string): string {
-  return input.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
 }
 
 function timestampId(date = new Date()): string {
@@ -297,7 +315,13 @@ async function savePageContext(payload: PageContextPayload): Promise<JsonRecord>
     url: payload.url ?? '',
     selectionText: payload.selectionText ?? '',
     bodyText: payload.bodyText ?? '',
+    mainText: payload.mainText ?? '',
     html: payload.html ?? '',
+    mainHtml: payload.mainHtml ?? '',
+    links: payload.links ?? [],
+    meta: payload.meta ?? {},
+    warnings: payload.warnings ?? [],
+    readyState: payload.readyState ?? 'unknown',
   }
 
   await writeJsonFile(PAGE_CONTEXT_PATH, pageContext)
@@ -308,7 +332,7 @@ async function savePageContext(payload: PageContextPayload): Promise<JsonRecord>
   }
 }
 
-async function enqueueCommand(type: CommandType, payload?: Record<string, unknown>): Promise<JsonRecord> {
+async function enqueueCommand(type: CommandType, payload?: Record<string, unknown>): Promise<{ ok: true; command: ExtensionCommand; queueSize: number }> {
   const command: ExtensionCommand = {
     id: createCommandId(),
     type,
@@ -333,6 +357,51 @@ async function saveCommandResult(result: ExtensionCommandResult): Promise<JsonRe
   }
   await persistLatestCommandResult()
   return { ok: true, savedTo: COMMAND_RESULT_PATH, result: latestCommandResult }
+}
+
+async function waitForCommandResult(commandId: string, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<ExtensionCommandResult> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt <= timeoutMs) {
+    if (latestCommandResult?.id === commandId) {
+      return latestCommandResult
+    }
+    await Bun.sleep(COMMAND_POLL_INTERVAL_MS)
+  }
+  throw new Error(`Timed out waiting for command result: ${commandId}`)
+}
+
+async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const { command } = await enqueueCommand('getPageContext')
+  const result = await waitForCommandResult(command.id, timeoutMs)
+
+  if (!result.ok) {
+    throw new Error(result.error ?? 'Failed to get page context')
+  }
+
+  const saved = await savePageContext({
+    source: 'browser-extension',
+    title: result.title,
+    url: result.url,
+    selectionText: result.selectionText,
+    bodyText: result.bodyText,
+    mainText: result.mainText,
+    html: result.html,
+    mainHtml: result.mainHtml,
+    links: result.links,
+    meta: result.meta,
+    warnings: result.warnings,
+    readyState: result.readyState,
+    timestamp: result.timestamp,
+  })
+
+  return {
+    ok: true,
+    via: 'extension-command-queue',
+    commandId: command.id,
+    result,
+    savedTo: saved.savedTo,
+    pageContext: saved,
+  }
 }
 
 async function handleAction(body: ActionRequest): Promise<JsonRecord> {
@@ -365,6 +434,8 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return saveContext(browser, false)
     case 'captureContext':
       return saveContext(browser, true)
+    case 'getPageContext':
+      return getPageContext(body.timeoutMs)
     default:
       throw new Error(`Unsupported action: ${String(action)}`)
   }

@@ -21,19 +21,72 @@ async function getActiveTab() {
   return tab
 }
 
+function uniqLinks(links) {
+  const seen = new Set()
+  return links.filter((link) => {
+    const key = `${link.href}\n${link.text}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function collectWarnings({ bodyText, mainText, title }) {
+  const haystack = `${title}\n${mainText}\n${bodyText}`.toLowerCase()
+  const warnings = []
+  if (haystack.includes('log in') || haystack.includes('sign up')) warnings.push('login_wall_signals')
+  if (haystack.includes('this page is not supported')) warnings.push('unsupported_page')
+  if (haystack.includes('something went wrong')) warnings.push('error_shell')
+  if (!mainText?.trim()) warnings.push('main_text_empty')
+  if ((bodyText?.trim().length ?? 0) < 200) warnings.push('body_text_short')
+  return warnings
+}
+
 async function extractPage(tabId) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
-    func: () => ({
-      title: document.title,
-      url: location.href,
-      selectionText: window.getSelection()?.toString() ?? '',
-      bodyText: document.body?.innerText ?? '',
-      html: document.documentElement?.outerHTML ?? '',
-      scrollY: window.scrollY,
-    }),
+    func: () => {
+      const main = document.querySelector('main, article, [role="main"]')
+      const links = [...document.querySelectorAll('a[href]')]
+        .map((anchor) => ({
+          href: anchor.href,
+          text: (anchor.innerText || anchor.textContent || '').trim(),
+        }))
+        .filter((link) => link.href)
+      const meta = Object.fromEntries(
+        [...document.querySelectorAll('meta[name], meta[property]')]
+          .map((node) => {
+            const key = node.getAttribute('name') || node.getAttribute('property')
+            const value = node.getAttribute('content') || ''
+            return key ? [key, value] : null
+          })
+          .filter(Boolean),
+      )
+
+      return {
+        title: document.title,
+        url: location.href,
+        readyState: document.readyState,
+        selectionText: window.getSelection()?.toString() ?? '',
+        bodyText: document.body?.innerText ?? '',
+        mainText: main?.innerText ?? '',
+        html: document.documentElement?.outerHTML ?? '',
+        mainHtml: main?.outerHTML ?? '',
+        links,
+        meta,
+        scrollY: window.scrollY,
+      }
+    },
   })
-  return result?.result
+
+  const page = result?.result ?? null
+  if (!page) return page
+
+  return {
+    ...page,
+    links: uniqLinks(page.links ?? []),
+    warnings: collectWarnings(page),
+  }
 }
 
 async function scrollByOnPage(tabId, y) {
@@ -116,7 +169,8 @@ async function executeCommand(command) {
       }
     }
 
-    case 'getPageText': {
+    case 'getPageText':
+    case 'getPageContext': {
       const tab = await getActiveTab()
       const page = await extractPage(tab.id)
       await postPageContext(page)
@@ -126,8 +180,15 @@ async function executeCommand(command) {
         type: command.type,
         url: page.url,
         title: page.title,
+        readyState: page.readyState,
+        selectionText: page.selectionText,
         bodyText: page.bodyText,
+        mainText: page.mainText,
         html: page.html,
+        mainHtml: page.mainHtml,
+        links: page.links,
+        meta: page.meta,
+        warnings: page.warnings,
         scrollY: page.scrollY,
       }
     }
