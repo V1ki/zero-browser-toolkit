@@ -13,6 +13,9 @@ type Action =
   | 'listTabs'
   | 'selectTab'
   | 'eval'
+  | 'click'
+  | 'input'
+  | 'getElements'
 
 type BrowserName = 'Google Chrome' | 'Safari'
 
@@ -23,6 +26,9 @@ type ActionRequest = {
   timeoutMs?: number
   tabId?: number | string
   expression?: string
+  selector?: string
+  index?: number
+  value?: string
 }
 
 type PageLink = {
@@ -54,7 +60,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'listTabs' | 'selectTab' | 'eval'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'listTabs' | 'selectTab' | 'eval' | 'click' | 'input' | 'getElements'
 
 type ExtensionCommand = {
   id: string
@@ -85,6 +91,9 @@ type ExtensionCommandResult = {
   value?: unknown
   error?: string
   timestamp?: string
+  tag?: string
+  text?: string
+  elements?: unknown[]
 }
 
 type JsonRecord = Record<string, unknown>
@@ -477,6 +486,23 @@ async function evalInPage(expression: string | undefined, timeoutMs = DEFAULT_CO
   }
 }
 
+async function clickInPage(selector: string, index = 0, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  if (!selector) throw new Error('Missing selector')
+  const result = await requestCommand('click', { selector, index }, timeoutMs)
+  return { ok: true, via: 'extension-command-queue', commandId: result.id, tabId: result.tabId ?? null, tag: result.tag, text: result.text }
+}
+
+async function inputInPage(selector: string, value: string, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  if (!selector) throw new Error('Missing selector')
+  const result = await requestCommand('input', { selector, value }, timeoutMs)
+  return { ok: true, via: 'extension-command-queue', commandId: result.id, tabId: result.tabId ?? null, value: result.value }
+}
+
+async function getElementsInPage(selector: string, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const result = await requestCommand('getElements', { selector }, timeoutMs)
+  return { ok: true, via: 'extension-command-queue', commandId: result.id, tabId: result.tabId ?? null, elements: result.elements }
+}
+
 async function handleAction(body: ActionRequest): Promise<JsonRecord> {
   const action = body.action
   const browser = body.browser ?? DEFAULT_BROWSER
@@ -515,6 +541,14 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return selectTab(body.tabId, body.timeoutMs)
     case 'eval':
       return evalInPage(body.expression, body.timeoutMs)
+    case 'click':
+      if (!body.selector) throw new Error('Missing selector')
+      return clickInPage(body.selector, body.index, body.timeoutMs)
+    case 'input':
+      if (!body.selector) throw new Error('Missing selector')
+      return inputInPage(body.selector, body.value ?? '', body.timeoutMs)
+    case 'getElements':
+      return getElementsInPage(body.selector ?? '*', body.timeoutMs)
     default:
       throw new Error(`Unsupported action: ${String(action)}`)
   }

@@ -101,11 +101,14 @@ async function runEval(tabId, expression) {
 
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
+    world: 'MAIN',
     args: [source],
     func: async (rawExpression) => {
       try {
-        const evaluator = new Function(`return (${rawExpression})`)
-        const output = await evaluator()
+        // Use indirect eval to avoid new Function() which is blocked by strict CSP
+        // In ISOLATED world, indirect eval is not subject to the page's CSP
+        // eslint-disable-next-line no-eval
+        const output = await (0, eval)(`(async () => { return (${rawExpression}) })()`)
         return {
           ok: true,
           ...(() => {
@@ -178,6 +181,71 @@ async function extractPage(tabId) {
     links: uniqLinks(page.links ?? []),
     warnings: collectWarnings(page),
   }
+}
+
+async function clickOnPage(tabId, selector, index) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [selector, index ?? 0],
+    func: (sel, idx) => {
+      const elements = document.querySelectorAll(sel)
+      const el = elements[idx]
+      if (!el) return { ok: false, error: `No element found for selector: ${sel} [${idx}]` }
+      el.scrollIntoView({ block: 'center' })
+      el.click()
+      return { ok: true, tag: el.tagName, text: (el.innerText || el.textContent || '').trim().slice(0, 100) }
+    },
+  })
+  const payload = result?.result
+  if (!payload?.ok) throw new Error(payload?.error ?? 'Click failed')
+  return payload
+}
+
+async function inputOnPage(tabId, selector, value) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [selector, value],
+    func: (sel, val) => {
+      const el = document.querySelector(sel)
+      if (!el) return { ok: false, error: `No element found for selector: ${sel}` }
+      el.focus()
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+        || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+      if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(el, val)
+      } else {
+        el.value = val
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: true, value: el.value }
+    },
+  })
+  const payload = result?.result
+  if (!payload?.ok) throw new Error(payload?.error ?? 'Input failed')
+  return payload
+}
+
+async function getElementsOnPage(tabId, selector) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [selector],
+    func: (sel) => {
+      const elements = [...document.querySelectorAll(sel)]
+      return elements.map((el, i) => ({
+        index: i,
+        tag: el.tagName,
+        text: (el.innerText || el.textContent || '').trim().slice(0, 200),
+        html: el.outerHTML.slice(0, 300),
+        href: el.href ?? null,
+        value: el.value ?? null,
+        type: el.type ?? null,
+        disabled: el.disabled ?? null,
+        ariaLabel: el.getAttribute('aria-label'),
+      }))
+    },
+  })
+  return result?.result ?? []
 }
 
 async function scrollByOnPage(tabId, y) {
@@ -327,6 +395,31 @@ async function executeCommand(command) {
         warnings: page.warnings,
         scrollY: page.scrollY,
       }
+    }
+
+    case 'click': {
+      const tab = await getActiveTab()
+      const selector = String(command.payload?.selector ?? '')
+      const index = Number(command.payload?.index ?? 0)
+      if (!selector) throw new Error('Missing selector')
+      const clicked = await clickOnPage(tab.id, selector, index)
+      return { id: command.id, ok: true, type: command.type, tabId: tab.id, ...clicked }
+    }
+
+    case 'input': {
+      const tab = await getActiveTab()
+      const selector = String(command.payload?.selector ?? '')
+      const value = String(command.payload?.value ?? '')
+      if (!selector) throw new Error('Missing selector')
+      const inputted = await inputOnPage(tab.id, selector, value)
+      return { id: command.id, ok: true, type: command.type, tabId: tab.id, ...inputted }
+    }
+
+    case 'getElements': {
+      const tab = await getActiveTab()
+      const selector = String(command.payload?.selector ?? '*')
+      const elements = await getElementsOnPage(tab.id, selector)
+      return { id: command.id, ok: true, type: command.type, tabId: tab.id, elements }
     }
 
     case 'scrollBy': {
