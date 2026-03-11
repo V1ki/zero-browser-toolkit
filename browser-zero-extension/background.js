@@ -1,6 +1,14 @@
 const BRIDGE_BASE = 'http://127.0.0.1:4318'
 const POLL_ALARM = 'zero-poll-command'
 
+// Ensure alarm exists on every service worker startup (covers reload/update/install)
+async function ensureAlarm() {
+  const existing = await chrome.alarms.get(POLL_ALARM)
+  if (!existing) {
+    chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.05 })
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.05 })
 })
@@ -8,6 +16,9 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.05 })
 })
+
+// Run immediately when service worker starts
+void ensureAlarm()
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {

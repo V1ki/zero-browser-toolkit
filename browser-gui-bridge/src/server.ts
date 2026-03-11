@@ -29,6 +29,8 @@ type ActionRequest = {
   selector?: string
   index?: number
   value?: string
+  fields?: string[]
+  maxLinks?: number
 }
 
 type PageLink = {
@@ -126,6 +128,8 @@ const COMMAND_QUEUE_PATH = `${SHARED_DIR}/command-queue.json`
 const COMMAND_RESULT_PATH = `${SHARED_DIR}/latest-command-result.json`
 const DEFAULT_COMMAND_TIMEOUT_MS = Number(Bun.env.BROWSER_GUI_BRIDGE_COMMAND_TIMEOUT_MS ?? '15000')
 const COMMAND_POLL_INTERVAL_MS = 250
+const DEFAULT_PAGE_CONTEXT_FIELDS = ['title', 'url', 'selectionText', 'bodyText', 'mainText', 'links', 'meta', 'warnings', 'readyState']
+const DEFAULT_MAX_LINKS = 50
 
 const commandQueue: ExtensionCommand[] = []
 let latestCommandResult: ExtensionCommandResult | null = null
@@ -413,9 +417,10 @@ async function requestCommand(type: CommandType, payload?: Record<string, unknow
   return result
 }
 
-async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, fields?: string[], maxLinks?: number): Promise<JsonRecord> {
   const result = await requestCommand('getPageContext', undefined, timeoutMs)
 
+  // Save full context to file for debugging
   const saved = await savePageContext({
     source: 'browser-extension',
     title: result.title,
@@ -432,13 +437,27 @@ async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<J
     timestamp: result.timestamp,
   })
 
+  // Build filtered context based on requested fields
+  const requestedFields = fields ?? DEFAULT_PAGE_CONTEXT_FIELDS
+  const effectiveMaxLinks = maxLinks ?? DEFAULT_MAX_LINKS
+  const filteredContext: JsonRecord = {}
+  for (const field of requestedFields) {
+    if (field in saved) {
+      filteredContext[field] = saved[field]
+    }
+  }
+
+  // Truncate links if present and exceeds maxLinks
+  if (Array.isArray(filteredContext.links) && filteredContext.links.length > effectiveMaxLinks) {
+    filteredContext.links = filteredContext.links.slice(0, effectiveMaxLinks)
+  }
+
   return {
     ok: true,
     via: 'extension-command-queue',
     commandId: result.id,
-    result,
     savedTo: saved.savedTo,
-    pageContext: saved,
+    pageContext: filteredContext,
   }
 }
 
@@ -534,7 +553,7 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
     case 'captureContext':
       return saveContext(browser, true)
     case 'getPageContext':
-      return getPageContext(body.timeoutMs)
+      return getPageContext(body.timeoutMs, body.fields, body.maxLinks)
     case 'listTabs':
       return listTabs(body.timeoutMs)
     case 'selectTab':
