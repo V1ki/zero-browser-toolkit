@@ -11,6 +11,7 @@
 - `saveContext`：将标题、URL、剪贴板、截图路径、窗口 bounds 和时间戳写入 `latest-context.json`
 - `captureContext`：先尝试复制当前选区，再保存完整上下文到 `latest-context.json`
 - `POST /page-context`：接收浏览器插件直接发送的页面正文、选区和 HTML，并保存到 `latest-page-context.json`
+- `POST /action { "action": "getPageContext" }`：返回适合直接放进 LLM 的页面概览，同时把完整页面保存在 `latest-page-context.json`
 
 > 这是 GUI/Automation 兜底方案，不是 DOM 级自动化。
 
@@ -93,6 +94,7 @@ curl -s http://127.0.0.1:4318/action \
 输出文件默认写到：
 
 - `/tmp/zero-browser-toolkit/browser-gui-bridge/latest-context.json`
+- `/tmp/zero-browser-toolkit/browser-gui-bridge/latest-page-context.json`
 
 也可通过环境变量覆盖：
 

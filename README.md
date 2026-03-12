@@ -67,6 +67,11 @@ curl http://127.0.0.1:4318/health
 ### `getPageContext`
 读取当前 active tab 的页面上下文。
 
+默认返回的是适合直接给 LLM 使用的“页面概览”：
+- 关键字段会内联返回
+- 超长 `bodyText` / `mainText` / `html` / `mainHtml` 会缩略显示
+- 完整页面内容始终保存在 `savedTo` 指向的文件里，供后续本地处理或定向读取
+
 #### Request
 ```json
 {
@@ -82,6 +87,10 @@ curl http://127.0.0.1:4318/health
   "via": "extension-command-queue",
   "commandId": "cmd_xxx",
   "savedTo": "/tmp/zero-browser-toolkit/browser-gui-bridge/latest-page-context.json",
+  "contentSizes": {
+    "bodyTextChars": 16046,
+    "htmlChars": 618509
+  },
   "pageContext": {
     "ok": true,
     "title": "Example",
@@ -110,6 +119,11 @@ curl http://127.0.0.1:4318/health
 - `links`
 - `meta`
 - `warnings`
+
+建议工作流：
+1. 先用 `getPageContext` 看 `warnings`、`contentSizes`、正文预览和 `savedTo`
+2. 需要精确 DOM 数据时，再用 `eval`
+3. 需要完整页面离线处理时，直接消费 `savedTo` 对应文件，不要把整页 HTML 原样打印回聊天
 
 #### Current Warning Signals
 - `login_wall_signals`

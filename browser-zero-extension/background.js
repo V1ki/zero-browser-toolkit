@@ -106,18 +106,15 @@ async function selectTab(tabId) {
   return toTabSummary(selected)
 }
 
-async function runEval(tabId, expression) {
-  const source = String(expression ?? '').trim()
-  if (!source) throw new Error('Missing expression')
-
+async function runEvalInWorld(tabId, source, world) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
-    world: 'MAIN',
+    world,
     args: [source],
     func: async (rawExpression) => {
       try {
-        // Use indirect eval to avoid new Function() which is blocked by strict CSP
-        // In ISOLATED world, indirect eval is not subject to the page's CSP
+        // Indirect eval — in ISOLATED world this is NOT subject to page CSP;
+        // in MAIN world it IS subject to page CSP but can access page JS globals.
         // eslint-disable-next-line no-eval
         const output = await (0, eval)(`(async () => { return (${rawExpression}) })()`)
         return {
@@ -142,9 +139,76 @@ async function runEval(tabId, expression) {
 
   const payload = result?.result
   if (!payload) throw new Error('No eval result returned')
-  if (!payload.ok) throw new Error(payload.error ?? 'Eval failed')
+  return payload
+}
 
-  return serializeEvalValue(payload.value)
+// Use chrome.debugger API (CDP Runtime.evaluate) to execute JS in the page.
+// This completely bypasses both page CSP and extension CSP restrictions.
+async function runEvalViaCDP(tabId, source) {
+  const debuggee = { tabId }
+
+  await chrome.debugger.attach(debuggee, '1.3')
+  try {
+    const evalResult = await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
+      expression: `(async () => { return (${source}) })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    })
+
+    if (evalResult.exceptionDetails) {
+      const errMsg = evalResult.exceptionDetails.exception?.description
+        ?? evalResult.exceptionDetails.text
+        ?? 'Unknown eval error'
+      return { ok: false, error: errMsg }
+    }
+
+    const value = evalResult.result?.value
+    if (value === undefined) {
+      return { value: null, warnings: ['eval_returned_undefined'] }
+    }
+    return { value, warnings: ['via_cdp_debugger'] }
+  } finally {
+    try { await chrome.debugger.detach(debuggee) } catch { /* ignore detach errors */ }
+  }
+}
+
+async function runEval(tabId, expression) {
+  const source = String(expression ?? '').trim()
+  if (!source) throw new Error('Missing expression')
+
+  // Strategy: try ISOLATED world first (immune to page CSP, can access DOM but
+  // not page JS globals), then fall back to MAIN world (can access page JS
+  // globals but subject to page CSP — will fail on strict-CSP sites).
+  const isolated = await runEvalInWorld(tabId, source, 'ISOLATED')
+  if (isolated.ok) {
+    return serializeEvalValue(isolated.value)
+  }
+
+  // ISOLATED failed (likely needs page JS globals) — try MAIN world
+  const main = await runEvalInWorld(tabId, source, 'MAIN')
+  if (main.ok) {
+    const result = serializeEvalValue(main.value)
+    result.warnings = [...(result.warnings || []), 'fell_back_to_main_world']
+    return result
+  }
+
+  // Both scripting worlds failed (likely due to page CSP blocking eval).
+  // Fall back to chrome.debugger CDP which bypasses CSP entirely.
+  try {
+    const cdpResult = await runEvalViaCDP(tabId, source)
+    if (cdpResult.ok === false) throw new Error(cdpResult.error)
+    const result = serializeEvalValue(cdpResult.value)
+    result.warnings = [...(result.warnings || []), ...(cdpResult.warnings || []), 'fell_back_to_cdp_debugger']
+    return result
+  } catch (cdpError) {
+    // All three methods failed
+    throw new Error(
+      cdpError instanceof Error ? cdpError.message
+        : main.error
+          ?? isolated.error
+          ?? 'Eval failed in ISOLATED, MAIN, and CDP worlds',
+    )
+  }
 }
 
 async function extractPage(tabId) {

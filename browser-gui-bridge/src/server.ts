@@ -130,6 +130,13 @@ const DEFAULT_COMMAND_TIMEOUT_MS = Number(Bun.env.BROWSER_GUI_BRIDGE_COMMAND_TIM
 const COMMAND_POLL_INTERVAL_MS = 250
 const DEFAULT_PAGE_CONTEXT_FIELDS = ['title', 'url', 'selectionText', 'bodyText', 'mainText', 'links', 'meta', 'warnings', 'readyState']
 const DEFAULT_MAX_LINKS = 50
+const INLINE_TEXT_LIMITS = {
+  selectionText: 1_500,
+  bodyText: 4_000,
+  mainText: 4_000,
+  html: 2_000,
+  mainHtml: 2_000,
+} as const
 
 const commandQueue: ExtensionCommand[] = []
 let latestCommandResult: ExtensionCommandResult | null = null
@@ -147,6 +154,42 @@ function timestampId(date = new Date()): string {
 
 function createCommandId(): string {
   return `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+function buildInlinePreview(text: string, limit: number, label: string, savedTo: string): string {
+  if (text.length <= limit) return text
+
+  const headChars = Math.max(200, Math.floor(limit * 0.65))
+  const tailChars = Math.max(120, Math.floor(limit * 0.2))
+  const head = text.slice(0, headChars)
+  const tail = text.slice(-tailChars)
+
+  return [
+    head,
+    '',
+    `[${label} omitted: ${text.length} chars total. Full content saved to ${savedTo}]`,
+    '',
+    tail,
+  ].join('\n')
+}
+
+function sanitizePageContextField(field: string, value: unknown, savedTo: string): unknown {
+  if (typeof value !== 'string') return value
+
+  switch (field) {
+    case 'selectionText':
+      return buildInlinePreview(value, INLINE_TEXT_LIMITS.selectionText, 'selectionText', savedTo)
+    case 'bodyText':
+      return buildInlinePreview(value, INLINE_TEXT_LIMITS.bodyText, 'bodyText', savedTo)
+    case 'mainText':
+      return buildInlinePreview(value, INLINE_TEXT_LIMITS.mainText, 'mainText', savedTo)
+    case 'html':
+      return buildInlinePreview(value, INLINE_TEXT_LIMITS.html, 'html', savedTo)
+    case 'mainHtml':
+      return buildInlinePreview(value, INLINE_TEXT_LIMITS.mainHtml, 'mainHtml', savedTo)
+    default:
+      return value
+  }
 }
 
 function normalizeTabId(value: number | string | undefined): number {
@@ -443,7 +486,7 @@ async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, fields?: s
   const filteredContext: JsonRecord = {}
   for (const field of requestedFields) {
     if (field in saved) {
-      filteredContext[field] = saved[field]
+      filteredContext[field] = sanitizePageContextField(field, saved[field], saved.savedTo as string)
     }
   }
 
@@ -457,6 +500,14 @@ async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, fields?: s
     via: 'extension-command-queue',
     commandId: result.id,
     savedTo: saved.savedTo,
+    contentSizes: {
+      selectionTextChars: String(saved.selectionText ?? '').length,
+      bodyTextChars: String(saved.bodyText ?? '').length,
+      mainTextChars: String(saved.mainText ?? '').length,
+      htmlChars: String(saved.html ?? '').length,
+      mainHtmlChars: String(saved.mainHtml ?? '').length,
+      linkCount: Array.isArray(saved.links) ? saved.links.length : 0,
+    },
     pageContext: filteredContext,
   }
 }
