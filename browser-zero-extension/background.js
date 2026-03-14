@@ -560,19 +560,52 @@ async function getAccessibilityTree(tabId, options = {}) {
       childrenByParent.get(node.parentId).push(node)
     }
 
+    // Roles that carry their text in name — child StaticText is redundant
+    const TEXT_CARRYING_ROLES = new Set([
+      'link', 'button', 'heading', 'tab', 'menuitem', 'menuitemcheckbox',
+      'menuitemradio', 'treeitem', 'option', 'radio', 'checkbox', 'switch',
+    ])
+
+    // Walk up the parent chain to find the nearest shown (non-generic/none) ancestor
+    function findShownAncestor(node) {
+      let cur = node.parentId ? nodesById.get(node.parentId) : null
+      while (cur) {
+        const r = cur.role?.value || ''
+        if (r !== 'none' && r !== 'generic' && r !== 'InlineTextBox') return cur
+        cur = cur.parentId ? nodesById.get(cur.parentId) : null
+      }
+      return null
+    }
+
     function shouldShow(node) {
       const role = node.role?.value || ''
       const name = node.name?.value ?? ''
       const value = node.value?.value
+
       if (compact && role === 'InlineTextBox') return false
-      return role !== 'none' && role !== 'generic' && !(name === '' && (value === '' || value == null))
+      if (role === 'none' || role === 'generic') return false
+      if (name === '' && (value === '' || value == null)) return false
+
+      // Dedup: skip StaticText whose text is already in the nearest shown ancestor's name
+      if (compact && role === 'StaticText') {
+        const ancestor = findShownAncestor(node)
+        if (ancestor) {
+          const ancestorRole = ancestor.role?.value || ''
+          const ancestorName = ancestor.name?.value ?? ''
+          if (TEXT_CARRYING_ROLES.has(ancestorRole) && ancestorName.includes(name)) {
+            return false
+          }
+        }
+      }
+
+      return true
     }
 
-    function formatNode(node, depth) {
+    function formatNode(node, visibleDepth) {
       const role = node.role?.value || ''
       const name = node.name?.value ?? ''
       const value = node.value?.value
-      const indent = '  '.repeat(Math.min(depth, 10))
+      const indent = '  '.repeat(Math.min(visibleDepth, 20))
       let line = `${indent}[${role}]`
       if (name !== '') line += ` ${name}`
       if (!(value === '' || value == null)) line += ` = ${JSON.stringify(value)}`
@@ -601,13 +634,19 @@ async function getAccessibilityTree(tabId, options = {}) {
     const lines = []
     const visited = new Set()
 
-    function visit(node, depth) {
+    // visibleDepth: only increments when the node itself is shown,
+    // so hidden generic/none wrappers don't inflate indentation.
+    function visit(node, visibleDepth) {
       if (!node || visited.has(node.nodeId)) return
-      if (maxDepth > 0 && depth > maxDepth) return
+      if (maxDepth > 0 && visibleDepth > maxDepth) return
       visited.add(node.nodeId)
-      if (shouldShow(node)) lines.push(formatNode(node, depth))
+
+      const show = shouldShow(node)
+      if (show) lines.push(formatNode(node, visibleDepth))
+
+      const nextDepth = show ? visibleDepth + 1 : visibleDepth
       for (const child of orderedChildren(node)) {
-        visit(child, depth + 1)
+        visit(child, nextDepth)
       }
     }
 
