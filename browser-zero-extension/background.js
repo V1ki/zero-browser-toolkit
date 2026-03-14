@@ -497,6 +497,27 @@ async function executeCommand(command) {
       return { id: command.id, ok: true, type: command.type, tabId: tab.id, elements }
     }
 
+    case 'getAccessibilityTree': {
+      const tab = await getActiveTab()
+      const options = {
+        compact: command.payload?.compact !== false,
+        maxDepth: command.payload?.maxDepth ?? 0,
+      }
+      const axResult = await getAccessibilityTree(tab.id, options)
+      return {
+        id: command.id,
+        ok: true,
+        type: command.type,
+        tabId: tab.id,
+        windowId: tab.windowId,
+        title: tab.title ?? '',
+        url: tab.url ?? '',
+        tree: axResult.tree,
+        nodeCount: axResult.nodeCount,
+        visibleNodeCount: axResult.visibleNodeCount,
+      }
+    }
+
     case 'scrollBy': {
       const tab = await getActiveTab()
       const offsetY = Number(command.payload?.y ?? 0)
@@ -515,6 +536,93 @@ async function executeCommand(command) {
 
     default:
       throw new Error(`Unsupported command type: ${command.type}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Accessibility Tree via CDP
+// ---------------------------------------------------------------------------
+
+async function getAccessibilityTree(tabId, options = {}) {
+  const compact = options.compact !== false
+  const maxDepth = Number(options.maxDepth) || 0
+
+  const debuggee = { tabId }
+  await chrome.debugger.attach(debuggee, '1.3')
+  try {
+    const { nodes } = await chrome.debugger.sendCommand(debuggee, 'Accessibility.getFullAXTree', {})
+
+    const nodesById = new Map(nodes.map((n) => [n.nodeId, n]))
+    const childrenByParent = new Map()
+    for (const node of nodes) {
+      if (!node.parentId) continue
+      if (!childrenByParent.has(node.parentId)) childrenByParent.set(node.parentId, [])
+      childrenByParent.get(node.parentId).push(node)
+    }
+
+    function shouldShow(node) {
+      const role = node.role?.value || ''
+      const name = node.name?.value ?? ''
+      const value = node.value?.value
+      if (compact && role === 'InlineTextBox') return false
+      return role !== 'none' && role !== 'generic' && !(name === '' && (value === '' || value == null))
+    }
+
+    function formatNode(node, depth) {
+      const role = node.role?.value || ''
+      const name = node.name?.value ?? ''
+      const value = node.value?.value
+      const indent = '  '.repeat(Math.min(depth, 10))
+      let line = `${indent}[${role}]`
+      if (name !== '') line += ` ${name}`
+      if (!(value === '' || value == null)) line += ` = ${JSON.stringify(value)}`
+      return line
+    }
+
+    function orderedChildren(node) {
+      const children = []
+      const seen = new Set()
+      for (const childId of node.childIds || []) {
+        const child = nodesById.get(childId)
+        if (child && !seen.has(child.nodeId)) {
+          seen.add(child.nodeId)
+          children.push(child)
+        }
+      }
+      for (const child of childrenByParent.get(node.nodeId) || []) {
+        if (!seen.has(child.nodeId)) {
+          seen.add(child.nodeId)
+          children.push(child)
+        }
+      }
+      return children
+    }
+
+    const lines = []
+    const visited = new Set()
+
+    function visit(node, depth) {
+      if (!node || visited.has(node.nodeId)) return
+      if (maxDepth > 0 && depth > maxDepth) return
+      visited.add(node.nodeId)
+      if (shouldShow(node)) lines.push(formatNode(node, depth))
+      for (const child of orderedChildren(node)) {
+        visit(child, depth + 1)
+      }
+    }
+
+    const roots = nodes.filter((n) => !n.parentId || !nodesById.has(n.parentId))
+    for (const root of roots) visit(root, 0)
+    for (const node of nodes) visit(node, 0)
+
+    return {
+      ok: true,
+      tree: lines.join('\n'),
+      nodeCount: nodes.length,
+      visibleNodeCount: lines.length,
+    }
+  } finally {
+    try { await chrome.debugger.detach(debuggee) } catch { /* ignore */ }
   }
 }
 

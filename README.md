@@ -10,6 +10,7 @@
 当前已支持：
 
 - `getPageContext`：读取当前 tab 的结构化页面上下文
+- `getAccessibilityTree`：获取当前 tab 的语义化无障碍树（Accessibility Tree）
 - `listTabs`：列出当前浏览器所有 tab
 - `selectTab`：切换到指定 tab
 - `eval`：在当前 tab 执行 JavaScript expression
@@ -134,6 +135,72 @@ curl http://127.0.0.1:4318/health
 
 ---
 
+### `getAccessibilityTree`
+获取当前 active tab 的语义化无障碍树（Accessibility Tree）。
+
+通过 Chrome DevTools Protocol 的 `Accessibility.getFullAXTree` 获取完整 AX 树，
+格式化为 `[role] name = value` 的缩进文本。比原始 HTML 信噪比高一个数量级。
+
+#### Request
+```json
+{
+  "action": "getAccessibilityTree"
+}
+```
+
+可选参数：
+```json
+{
+  "action": "getAccessibilityTree",
+  "compact": true,
+  "maxDepth": 5
+}
+```
+
+- `compact`（默认 `true`）：过滤 `InlineTextBox`、`none`、`generic` 等噪声节点
+- `maxDepth`（默认 `0` = 不限）：限制树的最大深度
+
+#### Response
+```json
+{
+  "ok": true,
+  "via": "extension-command-queue",
+  "commandId": "cmd_xxx",
+  "title": "Example",
+  "url": "https://example.com",
+  "savedTo": "/tmp/zero-browser-toolkit/browser-gui-bridge/latest-accessibility-tree.txt",
+  "stats": {
+    "totalNodes": 1234,
+    "visibleNodes": 456,
+    "treeChars": 28000
+  },
+  "tree": "[RootWebArea] Example\n  [heading] Welcome\n  [link] About\n  ..."
+}
+```
+
+#### 输出格式示例
+```
+[RootWebArea] Example Page
+  [navigation] Main
+    [link] Home
+    [link] About
+    [link] Contact
+  [main]
+    [heading] Welcome
+    [paragraph] This is the main content.
+    [textbox] Search = ""
+    [button] Submit
+  [contentinfo] Footer
+    [link] Privacy Policy
+```
+
+#### 使用建议
+- 需要理解交互结构时用 `getAccessibilityTree`，需要提取正文内容时用 `getPageContext`
+- 完整树可能很大，响应内联最多 8000 字符，完整内容在 `savedTo` 路径
+- 结合 `eval` 做后续定向操作：先用 AX 树定位角色和名称，再用 `eval` 精确操作
+
+---
+
 ### `listTabs`
 列出当前浏览器中的所有 tab。
 
@@ -251,6 +318,13 @@ curl http://127.0.0.1:4318/health
 curl -s http://127.0.0.1:4318/action \
   -H 'content-type: application/json' \
   -d '{"action":"getPageContext"}'
+```
+
+### 获取无障碍树
+```bash
+curl -s http://127.0.0.1:4318/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"getAccessibilityTree"}'
 ```
 
 ### 列出所有 tab

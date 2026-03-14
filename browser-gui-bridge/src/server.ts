@@ -10,6 +10,7 @@ type Action =
   | 'saveContext'
   | 'captureContext'
   | 'getPageContext'
+  | 'getAccessibilityTree'
   | 'listTabs'
   | 'selectTab'
   | 'eval'
@@ -31,6 +32,8 @@ type ActionRequest = {
   value?: string
   fields?: string[]
   maxLinks?: number
+  compact?: boolean
+  maxDepth?: number
 }
 
 type PageLink = {
@@ -62,7 +65,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'listTabs' | 'selectTab' | 'eval' | 'click' | 'input' | 'getElements'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'eval' | 'click' | 'input' | 'getElements'
 
 type ExtensionCommand = {
   id: string
@@ -96,6 +99,9 @@ type ExtensionCommandResult = {
   tag?: string
   text?: string
   elements?: unknown[]
+  tree?: string
+  nodeCount?: number
+  visibleNodeCount?: number
 }
 
 type JsonRecord = Record<string, unknown>
@@ -136,6 +142,7 @@ const INLINE_TEXT_LIMITS = {
   mainText: 4_000,
   html: 2_000,
   mainHtml: 2_000,
+  accessibilityTree: 8_000,
 } as const
 
 const commandQueue: ExtensionCommand[] = []
@@ -187,6 +194,8 @@ function sanitizePageContextField(field: string, value: unknown, savedTo: string
       return buildInlinePreview(value, INLINE_TEXT_LIMITS.html, 'html', savedTo)
     case 'mainHtml':
       return buildInlinePreview(value, INLINE_TEXT_LIMITS.mainHtml, 'mainHtml', savedTo)
+    case 'accessibilityTree':
+      return buildInlinePreview(value, INLINE_TEXT_LIMITS.accessibilityTree, 'accessibilityTree', savedTo)
     default:
       return value
   }
@@ -512,6 +521,38 @@ async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, fields?: s
   }
 }
 
+const AX_TREE_PATH = `${SHARED_DIR}/latest-accessibility-tree.txt`
+
+async function getAccessibilityTree(compact = true, maxDepth = 0, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+  const result = await requestCommand('getAccessibilityTree', { compact, maxDepth }, timeoutMs)
+
+  const fullTree = result.tree as string ?? ''
+  const nodeCount = result.nodeCount as number ?? 0
+  const visibleNodeCount = result.visibleNodeCount as number ?? 0
+
+  // Save full tree to file
+  await ensureDir(SHARED_DIR)
+  await Bun.write(AX_TREE_PATH, fullTree)
+
+  // Build inline preview
+  const inlineTree = sanitizePageContextField('accessibilityTree', fullTree, AX_TREE_PATH) as string
+
+  return {
+    ok: true,
+    via: 'extension-command-queue',
+    commandId: result.id,
+    title: result.title ?? '',
+    url: result.url ?? '',
+    savedTo: AX_TREE_PATH,
+    stats: {
+      totalNodes: nodeCount,
+      visibleNodes: visibleNodeCount,
+      treeChars: fullTree.length,
+    },
+    tree: inlineTree,
+  }
+}
+
 async function listTabs(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
   const result = await requestCommand('listTabs', undefined, timeoutMs)
   return {
@@ -605,6 +646,8 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return saveContext(browser, true)
     case 'getPageContext':
       return getPageContext(body.timeoutMs, body.fields, body.maxLinks)
+    case 'getAccessibilityTree':
+      return getAccessibilityTree(body.compact !== false, body.maxDepth ?? 0, body.timeoutMs)
     case 'listTabs':
       return listTabs(body.timeoutMs)
     case 'selectTab':
