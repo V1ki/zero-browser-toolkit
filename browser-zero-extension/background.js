@@ -77,15 +77,46 @@ function serializeEvalValue(value) {
   }
 }
 
-async function listTabs() {
-  const tabs = await chrome.tabs.query({})
+async function listTabs(payload = {}) {
+  const { query, limit, maxTitleLength } = payload
+  const allTabs = await chrome.tabs.query({})
   const activeTab = await getActiveTab()
+
+  let filtered = allTabs.filter((tab) => typeof tab.id === 'number' && typeof tab.windowId === 'number')
+
+  // keyword filter: match against title or url (case-insensitive)
+  if (query && typeof query === 'string') {
+    const lowerQuery = query.toLowerCase()
+    filtered = filtered.filter(
+      (tab) =>
+        (tab.title ?? '').toLowerCase().includes(lowerQuery) ||
+        (tab.url ?? '').toLowerCase().includes(lowerQuery),
+    )
+  }
+
+  const totalCount = filtered.length
+
+  // apply limit (default 30 to keep response compact)
+  const effectiveLimit = typeof limit === 'number' && limit > 0 ? limit : 30
+  const truncated = filtered.length > effectiveLimit
+  const sliced = filtered.slice(0, effectiveLimit)
+
+  // map to summary with optional title truncation
+  const titleLimit = typeof maxTitleLength === 'number' && maxTitleLength > 0 ? maxTitleLength : 80
+  const tabs = sliced.map((tab) => {
+    const summary = toTabSummary(tab)
+    if (summary.title.length > titleLimit) {
+      summary.title = summary.title.slice(0, titleLimit) + '…'
+    }
+    return summary
+  })
+
   return {
     tabId: activeTab.id,
     windowId: activeTab.windowId,
-    tabs: tabs
-      .filter((tab) => typeof tab.id === 'number' && typeof tab.windowId === 'number')
-      .map(toTabSummary),
+    totalCount,
+    truncated,
+    tabs,
   }
 }
 
@@ -406,13 +437,15 @@ async function executeCommand(command) {
     }
 
     case 'listTabs': {
-      const result = await listTabs()
+      const result = await listTabs(command.payload ?? {})
       return {
         id: command.id,
         ok: true,
         type: command.type,
         tabId: result.tabId,
         windowId: result.windowId,
+        totalCount: result.totalCount,
+        truncated: result.truncated,
         tabs: result.tabs,
       }
     }

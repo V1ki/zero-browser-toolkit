@@ -34,6 +34,10 @@ type ActionRequest = {
   maxLinks?: number
   compact?: boolean
   maxDepth?: number
+  // listTabs filtering
+  query?: string
+  limit?: number
+  maxTitleLength?: number
 }
 
 type PageLink = {
@@ -93,6 +97,8 @@ type ExtensionCommandResult = {
   tabId?: number
   windowId?: number
   tabs?: BrowserTab[]
+  totalCount?: number
+  truncated?: boolean
   value?: unknown
   error?: string
   timestamp?: string
@@ -553,16 +559,27 @@ async function getAccessibilityTree(compact = true, maxDepth = 0, timeoutMs = DE
   }
 }
 
-async function listTabs(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
-  const result = await requestCommand('listTabs', undefined, timeoutMs)
+async function listTabs(
+  query?: string,
+  limit?: number,
+  maxTitleLength?: number,
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+): Promise<JsonRecord> {
+  const payload: Record<string, unknown> = {}
+  if (query) payload.query = query
+  if (typeof limit === 'number') payload.limit = limit
+  if (typeof maxTitleLength === 'number') payload.maxTitleLength = maxTitleLength
+
+  const result = await requestCommand('listTabs', Object.keys(payload).length > 0 ? payload : undefined, timeoutMs)
   return {
     ok: true,
     via: 'extension-command-queue',
     commandId: result.id,
+    totalCount: result.totalCount ?? (result.tabs as unknown[])?.length ?? 0,
+    truncated: result.truncated ?? false,
     tabs: result.tabs ?? [],
     activeTabId: result.tabId ?? null,
     activeWindowId: result.windowId ?? null,
-    result,
   }
 }
 
@@ -649,7 +666,7 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
     case 'getAccessibilityTree':
       return getAccessibilityTree(body.compact !== false, body.maxDepth ?? 0, body.timeoutMs)
     case 'listTabs':
-      return listTabs(body.timeoutMs)
+      return listTabs(body.query as string | undefined, body.limit as number | undefined, body.maxTitleLength as number | undefined, body.timeoutMs)
     case 'selectTab':
       return selectTab(body.tabId, body.timeoutMs)
     case 'eval':
