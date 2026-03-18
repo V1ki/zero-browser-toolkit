@@ -32,6 +32,32 @@ async function getActiveTab() {
   return tab
 }
 
+async function getTargetTab(payload) {
+  const parsedTabId = Number(payload?.tabId)
+  if (Number.isInteger(parsedTabId) && parsedTabId > 0) {
+    let tab = await chrome.tabs.get(parsedTabId)
+    if (!tab?.id) throw new Error(`Tab not found: ${parsedTabId}`)
+
+    // If the tab was discarded by Chrome (memory saver), reload it and wait for it to finish
+    if (tab.discarded) {
+      await chrome.tabs.reload(parsedTabId)
+      // Wait for the tab to finish loading (poll up to 15s)
+      const deadline = Date.now() + 15000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        tab = await chrome.tabs.get(parsedTabId)
+        if (tab.status === 'complete') break
+      }
+      if (tab.status !== 'complete') {
+        console.warn(`Tab ${parsedTabId} reload timed out (status: ${tab.status}), proceeding anyway`)
+      }
+    }
+
+    return tab
+  }
+  return getActiveTab()
+}
+
 function uniqLinks(links) {
   const seen = new Set()
   return links.filter((link) => {
@@ -464,7 +490,7 @@ async function executeCommand(command) {
     }
 
     case 'eval': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const evaluated = await runEval(tab.id, command.payload?.expression)
       return {
         id: command.id,
@@ -481,7 +507,7 @@ async function executeCommand(command) {
 
     case 'getPageText':
     case 'getPageContext': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const page = await extractPage(tab.id)
       await postPageContext(page)
       return {
@@ -506,7 +532,7 @@ async function executeCommand(command) {
     }
 
     case 'click': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const selector = String(command.payload?.selector ?? '')
       const index = Number(command.payload?.index ?? 0)
       if (!selector) throw new Error('Missing selector')
@@ -515,7 +541,7 @@ async function executeCommand(command) {
     }
 
     case 'input': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const selector = String(command.payload?.selector ?? '')
       const value = String(command.payload?.value ?? '')
       if (!selector) throw new Error('Missing selector')
@@ -524,14 +550,14 @@ async function executeCommand(command) {
     }
 
     case 'getElements': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const selector = String(command.payload?.selector ?? '*')
       const elements = await getElementsOnPage(tab.id, selector)
       return { id: command.id, ok: true, type: command.type, tabId: tab.id, elements }
     }
 
     case 'getAccessibilityTree': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const options = {
         compact: command.payload?.compact !== false,
         maxDepth: command.payload?.maxDepth ?? 0,
@@ -552,7 +578,7 @@ async function executeCommand(command) {
     }
 
     case 'scrollBy': {
-      const tab = await getActiveTab()
+      const tab = await getTargetTab(command.payload)
       const offsetY = Number(command.payload?.y ?? 0)
       const page = await scrollByOnPage(tab.id, offsetY)
       return {

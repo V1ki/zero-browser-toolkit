@@ -162,7 +162,7 @@ function json(data: JsonRecord, status = 200): Response {
 }
 
 function timestampId(date = new Date()): string {
-  return date.toISOString().replaceAll(':', '-').replaceAll('.', '-')
+  return date.toISOString().replace(/:/g, '-').replace(/\./g, '-')
 }
 
 function createCommandId(): string {
@@ -352,7 +352,7 @@ async function getClipboardText(): Promise<{ text: string }> {
 async function screenshotFrontWindow(browser = DEFAULT_BROWSER): Promise<ScreenshotResult> {
   await ensureDir(SHARED_DIR)
   const bounds = await getWindowBounds(browser)
-  const filePath = `${SHARED_DIR}/${timestampId()}-${browser.replaceAll(' ', '-').toLowerCase()}.png`
+  const filePath = `${SHARED_DIR}/${timestampId()}-${browser.replace(/ /g, '-').toLowerCase()}.png`
   const rect = `${Math.round(bounds.x)},${Math.round(bounds.y)},${Math.round(bounds.width)},${Math.round(bounds.height)}`
 
   await runCommand(['screencapture', '-x', '-R', rect, filePath])
@@ -475,8 +475,15 @@ async function requestCommand(type: CommandType, payload?: Record<string, unknow
   return result
 }
 
-async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, fields?: string[], maxLinks?: number): Promise<JsonRecord> {
-  const result = await requestCommand('getPageContext', undefined, timeoutMs)
+async function getPageContext(
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  fields?: string[],
+  maxLinks?: number,
+  tabId?: number,
+): Promise<JsonRecord> {
+  const payload: Record<string, unknown> = {}
+  if (typeof tabId === 'number') payload.tabId = tabId
+  const result = await requestCommand('getPageContext', Object.keys(payload).length > 0 ? payload : undefined, timeoutMs)
 
   // Save full context to file for debugging
   const saved = await savePageContext({
@@ -529,8 +536,15 @@ async function getPageContext(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, fields?: s
 
 const AX_TREE_PATH = `${SHARED_DIR}/latest-accessibility-tree.txt`
 
-async function getAccessibilityTree(compact = true, maxDepth = 0, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
-  const result = await requestCommand('getAccessibilityTree', { compact, maxDepth }, timeoutMs)
+async function getAccessibilityTree(
+  compact = true,
+  maxDepth = 0,
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  tabId?: number,
+): Promise<JsonRecord> {
+  const payload: Record<string, unknown> = { compact, maxDepth }
+  if (typeof tabId === 'number') payload.tabId = tabId
+  const result = await requestCommand('getAccessibilityTree', payload, timeoutMs)
 
   const fullTree = result.tree as string ?? ''
   const nodeCount = result.nodeCount as number ?? 0
@@ -598,11 +612,17 @@ async function selectTab(tabId: number | string | undefined, timeoutMs = DEFAULT
   }
 }
 
-async function evalInPage(expression: string | undefined, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+async function evalInPage(
+  expression: string | undefined,
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  tabId?: number,
+): Promise<JsonRecord> {
   const source = String(expression ?? '').trim()
   if (!source) throw new Error('Missing expression')
 
-  const result = await requestCommand('eval', { expression: source }, timeoutMs)
+  const payload: Record<string, unknown> = { expression: source }
+  if (typeof tabId === 'number') payload.tabId = tabId
+  const result = await requestCommand('eval', payload, timeoutMs)
   return {
     ok: true,
     via: 'extension-command-queue',
@@ -614,20 +634,36 @@ async function evalInPage(expression: string | undefined, timeoutMs = DEFAULT_CO
   }
 }
 
-async function clickInPage(selector: string, index = 0, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+async function clickInPage(
+  selector: string,
+  index = 0,
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  tabId?: number,
+): Promise<JsonRecord> {
   if (!selector) throw new Error('Missing selector')
-  const result = await requestCommand('click', { selector, index }, timeoutMs)
+  const payload: Record<string, unknown> = { selector, index }
+  if (typeof tabId === 'number') payload.tabId = tabId
+  const result = await requestCommand('click', payload, timeoutMs)
   return { ok: true, via: 'extension-command-queue', commandId: result.id, tabId: result.tabId ?? null, tag: result.tag, text: result.text }
 }
 
-async function inputInPage(selector: string, value: string, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
+async function inputInPage(
+  selector: string,
+  value: string,
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  tabId?: number,
+): Promise<JsonRecord> {
   if (!selector) throw new Error('Missing selector')
-  const result = await requestCommand('input', { selector, value }, timeoutMs)
+  const payload: Record<string, unknown> = { selector, value }
+  if (typeof tabId === 'number') payload.tabId = tabId
+  const result = await requestCommand('input', payload, timeoutMs)
   return { ok: true, via: 'extension-command-queue', commandId: result.id, tabId: result.tabId ?? null, value: result.value }
 }
 
-async function getElementsInPage(selector: string, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<JsonRecord> {
-  const result = await requestCommand('getElements', { selector }, timeoutMs)
+async function getElementsInPage(selector: string, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, tabId?: number): Promise<JsonRecord> {
+  const payload: Record<string, unknown> = { selector }
+  if (typeof tabId === 'number') payload.tabId = tabId
+  const result = await requestCommand('getElements', payload, timeoutMs)
   return { ok: true, via: 'extension-command-queue', commandId: result.id, tabId: result.tabId ?? null, elements: result.elements }
 }
 
@@ -662,23 +698,23 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
     case 'captureContext':
       return saveContext(browser, true)
     case 'getPageContext':
-      return getPageContext(body.timeoutMs, body.fields, body.maxLinks)
+      return getPageContext(body.timeoutMs, body.fields, body.maxLinks, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'getAccessibilityTree':
-      return getAccessibilityTree(body.compact !== false, body.maxDepth ?? 0, body.timeoutMs)
+      return getAccessibilityTree(body.compact !== false, body.maxDepth ?? 0, body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'listTabs':
       return listTabs(body.query as string | undefined, body.limit as number | undefined, body.maxTitleLength as number | undefined, body.timeoutMs)
     case 'selectTab':
       return selectTab(body.tabId, body.timeoutMs)
     case 'eval':
-      return evalInPage(body.expression, body.timeoutMs)
+      return evalInPage(body.expression, body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'click':
       if (!body.selector) throw new Error('Missing selector')
-      return clickInPage(body.selector, body.index, body.timeoutMs)
+      return clickInPage(body.selector, body.index, body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'input':
       if (!body.selector) throw new Error('Missing selector')
-      return inputInPage(body.selector, body.value ?? '', body.timeoutMs)
+      return inputInPage(body.selector, body.value ?? '', body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'getElements':
-      return getElementsInPage(body.selector ?? '*', body.timeoutMs)
+      return getElementsInPage(body.selector ?? '*', body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     default:
       throw new Error(`Unsupported action: ${String(action)}`)
   }
