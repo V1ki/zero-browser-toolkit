@@ -71,17 +71,26 @@ curl http://127.0.0.1:4318/health
 ---
 
 ### `getPageContext`
-读取当前 active tab 的页面上下文。
+读取页面上下文。支持可选 `tabId` 指定目标 tab，不传则操作当前 active tab。
 
 默认返回的是适合直接给 LLM 使用的“页面概览”：
 - 关键字段会内联返回
 - 超长 `bodyText` / `mainText` / `html` / `mainHtml` 会缩略显示
 - 完整页面内容始终保存在 `savedTo` 指向的文件里，供后续本地处理或定向读取
+- 如果目标 tab 被 Chrome 休眠（discarded），会自动 reload 并等待加载完成
 
 #### Request
 ```json
 {
   "action": "getPageContext"
+}
+```
+
+指定 tab：
+```json
+{
+  "action": "getPageContext",
+  "tabId": 123
 }
 ```
 
@@ -150,6 +159,14 @@ curl http://127.0.0.1:4318/health
 ```json
 {
   "action": "getAccessibilityTree"
+}
+```
+
+指定 tab：
+```json
+{
+  "action": "getAccessibilityTree",
+  "tabId": 123
 }
 ```
 
@@ -273,6 +290,15 @@ curl http://127.0.0.1:4318/health
 }
 ```
 
+指定 tab：
+```json
+{
+  "action": "eval",
+  "tabId": 123,
+  "expression": "document.title"
+}
+```
+
 #### Response
 ```json
 {
@@ -346,11 +372,18 @@ curl -s http://127.0.0.1:4318/action \
 
 ## curl Examples
 
-### 读取当前页上下文
+### 读取页面上下文
 ```bash
 curl -s http://127.0.0.1:4318/action \
   -H 'content-type: application/json' \
   -d '{"action":"getPageContext"}'
+```
+
+### 读取指定 tab 的页面上下文
+```bash
+curl -s http://127.0.0.1:4318/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"getPageContext","tabId":123}'
 ```
 
 ### 获取无障碍树
