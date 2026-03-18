@@ -9,11 +9,16 @@
 ## Current Capabilities
 当前已支持：
 
-- `getPageContext`：读取当前 tab 的结构化页面上下文
-- `getAccessibilityTree`：获取当前 tab 的语义化无障碍树（Accessibility Tree）
+- `getPageContext`：读取页面的结构化上下文（支持 `tabId` 指定目标 tab）
+- `getAccessibilityTree`：获取语义化无障碍树（支持 `tabId`）
 - `listTabs`：列出当前浏览器所有 tab
-- `selectTab`：切换到指定 tab
-- `eval`：在当前 tab 执行 JavaScript expression
+- `selectTab`：切换到指定 tab 并聚焦窗口
+- `eval`：在页面中执行 JavaScript expression（支持 `tabId`）
+- `click` / `input` / `getElements`：页面交互操作（支持 `tabId`）
+
+### v0.4.1 新增
+- 所有 tab 依赖操作支持可选 `tabId` 参数，可直接操作指定 tab 无需先 `selectTab`
+- 自动检测并唤醒被 Chrome 休眠（discarded）的 tab
 
 ## Architecture
 整体链路：
@@ -136,7 +141,7 @@ curl http://127.0.0.1:4318/health
 ---
 
 ### `getAccessibilityTree`
-获取当前 active tab 的语义化无障碍树（Accessibility Tree）。
+获取语义化无障碍树（Accessibility Tree）。支持可选 `tabId` 指定目标 tab。
 
 通过 Chrome DevTools Protocol 的 `Accessibility.getFullAXTree` 获取完整 AX 树，
 格式化为 `[role] name = value` 的缩进文本。比原始 HTML 信噪比高一个数量级。
@@ -256,7 +261,7 @@ curl http://127.0.0.1:4318/health
 ---
 
 ### `eval`
-在当前 active tab 执行 JavaScript expression。
+在页面中执行 JavaScript expression。支持可选 `tabId` 指定目标 tab，不传则操作当前 active tab。
 
 > 目前支持的是 **expression**，不是整段 statement block。
 
@@ -308,6 +313,34 @@ curl http://127.0.0.1:4318/health
 - `eval_value_stringified`
 
 如果返回值无法直接 JSON 序列化，会自动退化为字符串。
+
+---
+
+## 指定 Tab 操作（v0.4.1+）
+
+`getPageContext`、`eval`、`click`、`input`、`getElements`、`getAccessibilityTree` 均支持可选的 `tabId` 参数。
+
+传入 `tabId` 后，命令直接在指定 tab 上执行，无需先 `selectTab`。在多窗口/多显示器环境下更可靠。
+
+如果目标 tab 被 Chrome 休眠（discarded），会自动 reload 并等待页面加载完成（最多 15 秒）。
+
+不传 `tabId` 时行为不变，仍操作当前活跃 tab。
+
+**推荐工作流（多窗口环境）：**
+1. `listTabs` 找到目标 tab 的 `tabId`
+2. 直接用 `tabId` 调用 `getPageContext` 或 `eval`，无需 `selectTab`
+
+```bash
+# 直接读取指定 tab 的页面内容
+curl -s http://127.0.0.1:4318/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"getPageContext","tabId":123}'
+
+# 直接在指定 tab 执行 JS
+curl -s http://127.0.0.1:4318/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"eval","tabId":123,"expression":"document.title"}'
+```
 
 ---
 
