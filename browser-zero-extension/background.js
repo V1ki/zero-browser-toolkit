@@ -163,6 +163,27 @@ async function selectTab(tabId) {
   return toTabSummary(selected)
 }
 
+async function captureTabScreenshot(payload) {
+  let tab
+  if (payload?.tabId !== undefined) {
+    const selected = await selectTab(payload.tabId)
+    tab = await chrome.tabs.get(selected.id)
+    await new Promise((resolve) => setTimeout(resolve, 350))
+  } else {
+    tab = await getActiveTab()
+  }
+
+  if (typeof tab?.windowId !== 'number') throw new Error('Unable to determine target window for screenshot')
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
+  return {
+    tabId: tab.id,
+    windowId: tab.windowId,
+    title: tab.title ?? '',
+    url: tab.url ?? '',
+    dataUrl,
+  }
+}
+
 async function runEvalInWorld(tabId, source, world) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
@@ -486,6 +507,20 @@ async function executeCommand(command) {
         windowId: selected.windowId,
         title: selected.title,
         url: selected.url,
+      }
+    }
+
+    case 'screenshot': {
+      const screenshot = await captureTabScreenshot(command.payload)
+      return {
+        id: command.id,
+        ok: true,
+        type: command.type,
+        tabId: screenshot.tabId,
+        windowId: screenshot.windowId,
+        title: screenshot.title,
+        url: screenshot.url,
+        dataUrl: screenshot.dataUrl,
       }
     }
 

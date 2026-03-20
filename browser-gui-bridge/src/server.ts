@@ -1,4 +1,7 @@
 import { $ } from 'bun'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 
 type Action =
   | 'health'
@@ -13,6 +16,7 @@ type Action =
   | 'getAccessibilityTree'
   | 'listTabs'
   | 'selectTab'
+  | 'screenshot'
   | 'eval'
   | 'click'
   | 'input'
@@ -38,6 +42,7 @@ type ActionRequest = {
   query?: string
   limit?: number
   maxTitleLength?: number
+  saveTo?: string
 }
 
 type PageLink = {
@@ -69,7 +74,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'eval' | 'click' | 'input' | 'getElements'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'screenshot' | 'eval' | 'click' | 'input' | 'getElements'
 
 type ExtensionCommand = {
   id: string
@@ -96,6 +101,7 @@ type ExtensionCommandResult = {
   scrollY?: number
   tabId?: number
   windowId?: number
+  dataUrl?: string
   tabs?: BrowserTab[]
   totalCount?: number
   truncated?: boolean
@@ -140,6 +146,7 @@ const COMMAND_QUEUE_PATH = `${SHARED_DIR}/command-queue.json`
 const COMMAND_RESULT_PATH = `${SHARED_DIR}/latest-command-result.json`
 const DEFAULT_COMMAND_TIMEOUT_MS = Number(Bun.env.BROWSER_GUI_BRIDGE_COMMAND_TIMEOUT_MS ?? '15000')
 const COMMAND_POLL_INTERVAL_MS = 250
+const DEFAULT_SCREENSHOT_DIR = join(homedir(), '.zero', 'browser', 'shared')
 const DEFAULT_PAGE_CONTEXT_FIELDS = ['title', 'url', 'selectionText', 'bodyText', 'mainText', 'links', 'meta', 'warnings', 'readyState']
 const DEFAULT_MAX_LINKS = 50
 const INLINE_TEXT_LIMITS = {
@@ -213,6 +220,31 @@ function normalizeTabId(value: number | string | undefined): number {
     throw new Error('Missing or invalid tabId')
   }
   return parsed
+}
+
+function resolveScreenshotPath(saveTo?: string, tabId?: number): string {
+  if (typeof saveTo === 'string' && saveTo.trim()) {
+    if (!isAbsolute(saveTo)) {
+      throw new Error('saveTo must be an absolute path')
+    }
+    return saveTo
+  }
+
+  const fileName = [
+    timestampId(),
+    'tab-screenshot',
+    typeof tabId === 'number' ? `tab-${tabId}` : 'active-tab',
+  ].join('-') + '.png'
+
+  return join(DEFAULT_SCREENSHOT_DIR, fileName)
+}
+
+function decodePngDataUrl(dataUrl: string): Buffer {
+  const match = /^data:image\/png;base64,(.+)$/s.exec(dataUrl.trim())
+  if (!match) {
+    throw new Error('Invalid screenshot data URL')
+  }
+  return Buffer.from(match[1], 'base64')
 }
 
 async function ensureDir(path: string): Promise<void> {
@@ -634,6 +666,32 @@ async function evalInPage(
   }
 }
 
+async function screenshotTab(
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  tabId?: number,
+  saveTo?: string,
+): Promise<JsonRecord> {
+  const payload: Record<string, unknown> = {}
+  if (typeof tabId === 'number') payload.tabId = tabId
+
+  const result = await requestCommand('screenshot', Object.keys(payload).length > 0 ? payload : undefined, timeoutMs)
+  const dataUrl = typeof result.dataUrl === 'string' ? result.dataUrl : ''
+  if (!dataUrl) throw new Error('Extension did not return screenshot data')
+
+  const filePath = resolveScreenshotPath(saveTo, typeof result.tabId === 'number' ? result.tabId : tabId)
+  mkdirSync(dirname(filePath), { recursive: true })
+  writeFileSync(filePath, decodePngDataUrl(dataUrl))
+
+  return {
+    ok: true,
+    via: 'extension-command-queue',
+    commandId: result.id,
+    tabId: result.tabId ?? tabId ?? null,
+    windowId: result.windowId ?? null,
+    savedTo: filePath,
+  }
+}
+
 async function clickInPage(
   selector: string,
   index = 0,
@@ -705,6 +763,8 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return listTabs(body.query as string | undefined, body.limit as number | undefined, body.maxTitleLength as number | undefined, body.timeoutMs)
     case 'selectTab':
       return selectTab(body.tabId, body.timeoutMs)
+    case 'screenshot':
+      return screenshotTab(body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined, body.saveTo)
     case 'eval':
       return evalInPage(body.expression, body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'click':
