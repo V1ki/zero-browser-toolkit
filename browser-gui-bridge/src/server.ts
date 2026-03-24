@@ -74,7 +74,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'screenshot' | 'eval' | 'click' | 'input' | 'getElements'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'closeTabs' | 'screenshot' | 'eval' | 'click' | 'input' | 'getElements'
 
 type ExtensionCommand = {
   id: string
@@ -327,8 +327,6 @@ async function getFrontBrowserInfo(browser = DEFAULT_BROWSER): Promise<BrowserIn
 async function getWindowBounds(browser = DEFAULT_BROWSER): Promise<WindowBounds> {
   const script = `
     tell application "${browser}"
-      activate
-      delay 0.1
       if not (exists front window) then
         error "No front window"
       end if
@@ -362,18 +360,23 @@ async function openUrl(url: string, browser = DEFAULT_BROWSER): Promise<JsonReco
   }
 }
 
-async function copySelection(browser = DEFAULT_BROWSER): Promise<{ browser: BrowserName; attempted: true }> {
-  const script = `
-    tell application "${browser}" to activate
-    delay 0.2
-    tell application "System Events"
-      keystroke "c" using command down
-    end tell
-    return "ok"
-  `
-  await runAppleScript(script)
-  await Bun.sleep(300)
-  return { browser, attempted: true }
+async function copySelection(browser = DEFAULT_BROWSER): Promise<{ browser: BrowserName; attempted: true; selectionText?: string }> {
+  // Use extension eval to get selection text directly, no need to activate browser or simulate keystrokes
+  try {
+    const result = await requestCommand('eval', { expression: 'window.getSelection().toString()' }, 5000)
+    const text = typeof result.value === 'string' ? result.value : ''
+    if (text) {
+      // Also put it on clipboard for backward compatibility
+      const proc = Bun.spawn(['pbcopy'], { stdin: 'pipe' })
+      proc.stdin.write(text)
+      proc.stdin.end()
+      await proc.exited
+    }
+    return { browser, attempted: true, selectionText: text }
+  } catch {
+    // Fallback: just return without selection
+    return { browser, attempted: true, selectionText: '' }
+  }
 }
 
 async function getClipboardText(): Promise<{ text: string }> {
@@ -383,17 +386,27 @@ async function getClipboardText(): Promise<{ text: string }> {
 
 async function screenshotFrontWindow(browser = DEFAULT_BROWSER): Promise<ScreenshotResult> {
   await ensureDir(SHARED_DIR)
-  const bounds = await getWindowBounds(browser)
   const filePath = `${SHARED_DIR}/${timestampId()}-${browser.replace(/ /g, '-').toLowerCase()}.png`
-  const rect = `${Math.round(bounds.x)},${Math.round(bounds.y)},${Math.round(bounds.width)},${Math.round(bounds.height)}`
 
+  // Use extension's captureVisibleTab API instead of screencapture + activate
+  try {
+    const result = await requestCommand('screenshot', undefined, 10000)
+    const dataUrl = typeof result.dataUrl === 'string' ? result.dataUrl : ''
+    if (dataUrl) {
+      const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
+      writeFileSync(filePath, Buffer.from(base64, 'base64'))
+      return { browser, filePath, bounds: { x: 0, y: 0, width: 0, height: 0 } }
+    }
+  } catch {
+    // Fallback to screencapture without activate
+  }
+
+  // Fallback: screencapture without activate (captures whatever is visible)
+  const bounds = await getWindowBounds(browser)
+  const rect = `${Math.round(bounds.x)},${Math.round(bounds.y)},${Math.round(bounds.width)},${Math.round(bounds.height)}`
   await runCommand(['screencapture', '-x', '-R', rect, filePath])
 
-  return {
-    browser,
-    filePath,
-    bounds,
-  }
+  return { browser, filePath, bounds }
 }
 
 async function buildContext(browser = DEFAULT_BROWSER, attemptCopySelection = false): Promise<JsonRecord> {
@@ -763,6 +776,11 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return listTabs(body.query as string | undefined, body.limit as number | undefined, body.maxTitleLength as number | undefined, body.timeoutMs)
     case 'selectTab':
       return selectTab(body.tabId, body.timeoutMs)
+    case 'closeTabs': {
+      if (!body.tabIds || !Array.isArray(body.tabIds)) throw new Error('Missing tabIds array')
+      const result = await requestCommand('closeTabs', { tabIds: body.tabIds }, body.timeoutMs)
+      return result
+    }
     case 'screenshot':
       return screenshotTab(body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined, body.saveTo)
     case 'eval':

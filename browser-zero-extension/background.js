@@ -510,6 +510,15 @@ async function executeCommand(command) {
       }
     }
 
+    case 'closeTabs': {
+      const tabIds = command.payload?.tabIds
+      if (!tabIds || !Array.isArray(tabIds) || tabIds.length === 0) {
+        return { id: command.id, ok: false, error: 'tabIds (array) is required' }
+      }
+      await chrome.tabs.remove(tabIds)
+      return { id: command.id, ok: true, type: command.type, closed: tabIds.length }
+    }
+
     case 'screenshot': {
       const screenshot = await captureTabScreenshot(command.payload)
       return {
