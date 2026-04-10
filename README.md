@@ -13,12 +13,39 @@
 - `getAccessibilityTree`：获取语义化无障碍树（支持 `tabId`）
 - `listTabs`：列出当前浏览器所有 tab
 - `selectTab`：切换到指定 tab 并聚焦窗口
+- `closeTab` / `closeTabs`：关闭单个或多个 tab
 - `eval`：在页面中执行 JavaScript expression（支持 `tabId`）
 - `click` / `input` / `getElements`：页面交互操作（支持 `tabId`）
+- `screenshot`：截取页面（支持 `tabId`、CSS `selector` 元素裁剪、`rect` 矩形裁剪、`padding`，跨平台）
+- `reloadExtension`：触发扩展自身重载，方便热更新 background.js
 
 ### v0.4.1 新增
 - 所有 tab 依赖操作支持可选 `tabId` 参数，可直接操作指定 tab 无需先 `selectTab`
 - 自动检测并唤醒被 Chrome 休眠（discarded）的 tab
+
+### v0.6.0 新增
+- `screenshot` 元素裁剪：传 `selector` 自动定位、scrollIntoView 后裁剪到元素 bounding rect
+- `screenshot` 长截图：当目标元素超过 viewport 高度时，bridge 端自动滚动捕获多段并用 pngjs 拼接 → 跨平台纯 JS，无 sips/ImageMagick 依赖
+- `screenshot` 支持 `mode: "cdp"`：通过 chrome.debugger + `Page.captureScreenshot` 截取**非可见 tab**，不切换用户当前焦点；支持 `captureBeyondViewport` 一次成像
+- `screenshot` 支持 `mode: "visible"` + `restoreActive: true`：截完恢复原 active tab
+- `reloadExtension` 命令：bridge 可触发 extension 自身 `chrome.runtime.reload()`，避免每次改 background.js 都要手动 reload
+
+### v0.6.15 关键修复（头像/图片渲染）
+- X.com 等 SPA 把头像放在**opacity:0 的 `<img>` + sibling div 的 `background-image`**上；后者在截图时经常被画成黑色
+- 新默认行为 `forceImgOpacity:true`：截图前自动克隆所有可见 `<img>` 到 `<body>` 顶层，用 `position:fixed` 钉在原 bounding rect 上，`z-index: 2147483647`，`border-radius` 继承父元素。React 不会 reconcile 这些注入元素，所以不会被清掉
+- CDP 模式**默认关闭** `Emulation.setDeviceMetricsOverride`：X 在 override 状态下会 reflow/remount 整片内容，把 overlay 也清掉了。关掉 override 后 captureBeyondViewport 一样能拿到全 article
+- 最终结果：CDP 后台 4 秒完成，1244×2960 主帖完整截图，含 Karpathy 头像 + 用户名 + 5 段正文 + 时间戳和浏览数
+
+### v0.6.1 ~ v0.6.11 增量改进
+- CDP 路径**一站式**：selector 测量 + capture 都在同一次 `chrome.debugger.attach` 会话中完成，不再依赖外部 `chrome.scripting` eval。彻底消除虚拟滚动列表（react-virtualized / X.com 等）下「测量看到的 DOM」与「截图看到的 DOM」不一致的竞态
+- `screenshot` 新增 `reload: true`：CDP 会话内通过 `Page.reload` 触发目标 tab reload，并等待 `Page.loadEventFired`——在**完全后台、不切 tab、不切 window**的前提下完成。专门解决"目标 tab 历史滚动状态错误"的场景
+- `screenshot` 新增 `waitMs` / `evalBefore`：reload 后追加等待 / 注入预处理 JS（例如 `window.scrollTo(0,0)`）
+- `screenshot` 新增 `deviceMetrics`：CDP 路径**默认**用 `Emulation.setDeviceMetricsOverride` 强制 1512×3000@2x 桌面布局
+  - 修复 1：X.com 等响应式站点在后台 tab 上被收缩成窄列
+  - 修复 2：**SPA lazy-render** 问题——viewport 高度大到能容下整个目标元素时，IntersectionObserver 一次触发所有内容渲染，**头像/按钮/图片**全部加载，不再是透明占位符
+  - 修复 3：单段截图，**彻底没有拼接痕迹**
+- CDP 路径每次调用前自动尝试 `chrome.debugger.detach`，避免上次失败留下的悬挂 attach
+- 验证：3 个 Chrome window 并存，目标 tab 在第三个 window 且 `active=false` → CDP 一站式 reload + measure + capture，输出 1244×2960 完整主帖截图（含头像 + 用户名 + 5 段正文 + 互动按钮），全过程 ~15 秒，3 个 window 的 active tab 全部纹丝未动 ✅
 
 ## Architecture
 整体链路：
@@ -277,6 +304,48 @@ curl http://127.0.0.1:4318/health
 
 ---
 
+### `closeTab`
+关闭单个 tab。`closeTabs` 的便捷别名。
+
+#### Request
+```json
+{
+  "action": "closeTab",
+  "tabId": 123
+}
+```
+
+#### Response
+```json
+{
+  "ok": true,
+  "closed": 1
+}
+```
+
+---
+
+### `closeTabs`
+批量关闭多个 tab。
+
+#### Request
+```json
+{
+  "action": "closeTabs",
+  "tabIds": [123, 456]
+}
+```
+
+#### Response
+```json
+{
+  "ok": true,
+  "closed": 2
+}
+```
+
+---
+
 ### `eval`
 在页面中执行 JavaScript expression。支持可选 `tabId` 指定目标 tab，不传则操作当前 active tab。
 
@@ -405,6 +474,20 @@ curl -s http://127.0.0.1:4318/action \
 curl -s http://127.0.0.1:4318/action \
   -H 'content-type: application/json' \
   -d '{"action":"selectTab","tabId":123}'
+```
+
+### 关闭单个 tab
+```bash
+curl -s http://127.0.0.1:4318/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"closeTab","tabId":123}'
+```
+
+### 批量关闭多个 tab
+```bash
+curl -s http://127.0.0.1:4318/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"closeTabs","tabIds":[123,456]}'
 ```
 
 ### 执行 eval
