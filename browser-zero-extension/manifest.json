@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Zero Browser Context",
-  "version": "0.5.0",
+  "version": "0.7.4",
   "description": "Send current page text to local Zero bridge and receive commands.",
   "permissions": [
     "activeTab",
@@ -20,5 +20,16 @@
   "action": {
     "default_title": "Send page to Zero",
     "default_popup": "popup.html"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "html2canvas.min.js",
+        "html-to-image.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
 }

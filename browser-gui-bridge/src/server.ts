@@ -1,5 +1,5 @@
 import { $ } from 'bun'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 
@@ -16,11 +16,14 @@ type Action =
   | 'getAccessibilityTree'
   | 'listTabs'
   | 'selectTab'
+  | 'closeTab'
+  | 'closeTabs'
   | 'screenshot'
   | 'eval'
   | 'click'
   | 'input'
   | 'getElements'
+  | 'reloadExtension'
 
 type BrowserName = 'Google Chrome' | 'Safari'
 
@@ -30,6 +33,7 @@ type ActionRequest = {
   browser?: BrowserName
   timeoutMs?: number
   tabId?: number | string
+  tabIds?: Array<number | string>
   expression?: string
   selector?: string
   index?: number
@@ -43,6 +47,20 @@ type ActionRequest = {
   limit?: number
   maxTitleLength?: number
   saveTo?: string
+  // screenshot cropping
+  padding?: number | { top?: number; right?: number; bottom?: number; left?: number; x?: number; y?: number }
+  rect?: { x?: number; y?: number; left?: number; top?: number; width?: number; height?: number }
+  format?: 'png' | 'jpeg'
+  quality?: number
+  mode?: 'visible' | 'cdp' | 'dom'
+  restoreActive?: boolean
+  reload?: boolean
+  waitMs?: number
+  evalBefore?: string
+  deviceMetrics?: { width?: number; height?: number; deviceScaleFactor?: number } | null
+  forceImgOpacity?: boolean
+  backgroundColor?: string | null
+  scale?: number
 }
 
 type PageLink = {
@@ -74,7 +92,7 @@ type PageContextPayload = {
   timestamp?: string
 }
 
-type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'closeTabs' | 'screenshot' | 'eval' | 'click' | 'input' | 'getElements'
+type CommandType = 'openUrl' | 'getPageText' | 'scrollBy' | 'getPageContext' | 'getAccessibilityTree' | 'listTabs' | 'selectTab' | 'closeTabs' | 'screenshot' | 'eval' | 'click' | 'input' | 'getElements' | 'reloadExtension'
 
 type ExtensionCommand = {
   id: string
@@ -102,6 +120,10 @@ type ExtensionCommandResult = {
   tabId?: number
   windowId?: number
   dataUrl?: string
+  cropRect?: { x: number; y: number; width: number; height: number; dpr?: number } | null
+  cdpMeta?: { rect: { x: number; y: number; width: number; height: number }; dpr: number; viewport: { width: number; height: number } } | null
+  cdpClip?: { x: number; y: number; width: number; height: number; scale?: number } | null
+  domMeta?: { rect: { x: number; y: number; width: number; height: number }; canvas: { width: number; height: number }; scale: number; viewport: { width: number; height: number } } | null
   tabs?: BrowserTab[]
   totalCount?: number
   truncated?: boolean
@@ -214,12 +236,23 @@ function sanitizePageContextField(field: string, value: unknown, savedTo: string
   }
 }
 
+class BadRequestError extends Error {
+  status = 400 as const
+}
+
 function normalizeTabId(value: number | string | undefined): number {
   const parsed = typeof value === 'number' ? value : Number(String(value ?? '').trim())
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new Error('Missing or invalid tabId')
+    throw new BadRequestError('Missing or invalid tabId')
   }
   return parsed
+}
+
+function normalizeTabIds(values: Array<number | string> | undefined): number[] {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new BadRequestError('tabIds (array) is required')
+  }
+  return values.map((value) => normalizeTabId(value))
 }
 
 function resolveScreenshotPath(saveTo?: string, tabId?: number): string {
@@ -245,6 +278,14 @@ function decodePngDataUrl(dataUrl: string): Buffer {
     throw new Error('Invalid screenshot data URL')
   }
   return Buffer.from(match[1], 'base64')
+}
+
+function decodeImageDataUrl(dataUrl: string): Buffer {
+  const match = /^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/s.exec(dataUrl.trim())
+  if (!match) {
+    throw new Error('Invalid image data URL')
+  }
+  return Buffer.from(match[2], 'base64')
 }
 
 async function ensureDir(path: string): Promise<void> {
@@ -679,29 +720,465 @@ async function evalInPage(
   }
 }
 
-async function screenshotTab(
-  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
-  tabId?: number,
-  saveTo?: string,
-): Promise<JsonRecord> {
-  const payload: Record<string, unknown> = {}
-  if (typeof tabId === 'number') payload.tabId = tabId
+type PaddingInput =
+  | number
+  | { top?: number; right?: number; bottom?: number; left?: number; x?: number; y?: number }
+  | undefined
 
+type RectInput = { x?: number; y?: number; left?: number; top?: number; width?: number; height?: number } | undefined
+
+type ScreenshotOptions = {
+  tabId?: number
+  saveTo?: string
+  selector?: string
+  index?: number
+  padding?: PaddingInput
+  rect?: RectInput
+  mode?: 'visible' | 'cdp' | 'dom'
+  restoreActive?: boolean
+  reload?: boolean
+  waitMs?: number
+  evalBefore?: string
+  deviceMetrics?: { width?: number; height?: number; deviceScaleFactor?: number } | null
+  forceImgOpacity?: boolean
+  backgroundColor?: string | null
+  scale?: number
+}
+
+type NormalizedPadding = { top: number; right: number; bottom: number; left: number }
+type CropRect = { x: number; y: number; width: number; height: number }
+
+function normalizePadding(value: PaddingInput): NormalizedPadding {
+  if (value == null) return { top: 0, right: 0, bottom: 0, left: 0 }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return { top: value, right: value, bottom: value, left: value }
+  }
+  if (typeof value === 'object') {
+    const top = Number((value as any).top ?? (value as any).y ?? 0) || 0
+    const right = Number((value as any).right ?? (value as any).x ?? 0) || 0
+    const bottom = Number((value as any).bottom ?? (value as any).y ?? 0) || 0
+    const left = Number((value as any).left ?? (value as any).x ?? 0) || 0
+    return { top, right, bottom, left }
+  }
+  return { top: 0, right: 0, bottom: 0, left: 0 }
+}
+
+function normalizeRectInput(rect: RectInput): CropRect | null {
+  if (!rect || typeof rect !== 'object') return null
+  const x = Number(rect.x ?? rect.left)
+  const y = Number(rect.y ?? rect.top)
+  const width = Number(rect.width)
+  const height = Number(rect.height)
+  if (![x, y, width, height].every((v) => Number.isFinite(v))) return null
+  return { x, y, width, height }
+}
+
+async function measureElement(
+  tabId: number,
+  selector: string,
+  index: number,
+  timeoutMs: number,
+): Promise<{ rect: CropRect; dpr: number; viewport: { width: number; height: number } }> {
+  const expression = `(function(){
+    var nodes = document.querySelectorAll(${JSON.stringify(selector)});
+    if (!nodes.length) throw new Error('No element matches selector: ' + ${JSON.stringify(selector)});
+    var el = nodes[${index}] || nodes[0];
+    el.scrollIntoView({block: 'center', inline: 'center'});
+    var r = el.getBoundingClientRect();
+    return { rect: { x: r.left, y: r.top, width: r.width, height: r.height }, dpr: window.devicePixelRatio || 1, viewport: { width: window.innerWidth, height: window.innerHeight } };
+  })()`
+  const result = await requestCommand('eval', { expression, tabId }, timeoutMs)
+  const value = result.value as any
+  if (!value || !value.rect) throw new Error('Failed to measure element rect')
+  return value
+}
+
+async function getViewportInfoBridge(tabId: number, timeoutMs: number): Promise<{ dpr: number; viewport: { width: number; height: number } }> {
+  const expression = `({ dpr: window.devicePixelRatio || 1, viewport: { width: window.innerWidth, height: window.innerHeight } })`
+  const result = await requestCommand('eval', { expression, tabId }, timeoutMs)
+  return result.value as any
+}
+
+/**
+ * Crop a PNG file in-place using pure JS (pngjs). Cross-platform: no sips/imagemagick.
+ * Returns the actual cropped rect (clamped to image bounds).
+ */
+async function cropPngFile(
+  inputPath: string,
+  rect: { x: number; y: number; width: number; height: number },
+): Promise<{ x: number; y: number; width: number; height: number; sourceWidth: number; sourceHeight: number }> {
+  const buf = readFileSync(inputPath)
+  const { PNG } = await import('pngjs')
+  const src = PNG.sync.read(buf)
+
+  let sx = Math.round(rect.x)
+  let sy = Math.round(rect.y)
+  let sw = Math.round(rect.width)
+  let sh = Math.round(rect.height)
+  if (sx < 0) { sw += sx; sx = 0 }
+  if (sy < 0) { sh += sy; sy = 0 }
+  if (sx + sw > src.width) sw = src.width - sx
+  if (sy + sh > src.height) sh = src.height - sy
+  if (sw <= 0 || sh <= 0) throw new Error(`Empty crop rect after clamp: ${JSON.stringify({ sx, sy, sw, sh })}`)
+
+  const dst = new PNG({ width: sw, height: sh })
+  // pngjs always exposes data as 4 bytes per pixel (RGBA) regardless of source colorType
+  const bpp = 4
+  for (let row = 0; row < sh; row++) {
+    const srcStart = ((sy + row) * src.width + sx) * bpp
+    const dstStart = row * sw * bpp
+    src.data.copy(dst.data, dstStart, srcStart, srcStart + sw * bpp)
+  }
+  const out = PNG.sync.write(dst)
+  writeFileSync(inputPath, out)
+  return { x: sx, y: sy, width: sw, height: sh, sourceWidth: src.width, sourceHeight: src.height }
+}
+
+/**
+ * Capture one visible-tab screenshot via the extension and return the buffer.
+ * Pass extra fields to the extension's screenshot command via `extra`.
+ */
+async function captureVisibleTabBuffer(
+  tabId: number | undefined,
+  timeoutMs: number,
+  extra: Record<string, unknown> = {},
+): Promise<Buffer> {
+  const payload: Record<string, unknown> = { ...extra }
+  if (typeof tabId === 'number') payload.tabId = tabId
   const result = await requestCommand('screenshot', Object.keys(payload).length > 0 ? payload : undefined, timeoutMs)
   const dataUrl = typeof result.dataUrl === 'string' ? result.dataUrl : ''
   if (!dataUrl) throw new Error('Extension did not return screenshot data')
+  return decodeImageDataUrl(dataUrl)
+}
 
-  const filePath = resolveScreenshotPath(saveTo, typeof result.tabId === 'number' ? result.tabId : tabId)
+/**
+ * Capture an entire tab (or a clip rect inside it) via Chrome DevTools Protocol.
+ * Works for non-active tabs and even tabs in non-foreground windows without
+ * changing user focus or switching tabs. Supports captureBeyondViewport so we
+ * don't need to scroll-and-stitch.
+ *
+ * Selector measurement happens INSIDE the same chrome.debugger attach session
+ * inside the extension, so DOM state is consistent with the capture (important
+ * for virtualized lists / single-page apps).
+ */
+async function captureViaCdp(
+  tabId: number,
+  timeoutMs: number,
+  opts: {
+    clip?: { x: number; y: number; width: number; height: number; scale?: number }
+    selector?: string
+    selectorIndex?: number
+    padding?: { top: number; right: number; bottom: number; left: number }
+    captureBeyondViewport?: boolean
+    reload?: boolean
+    waitMs?: number
+    restoreActive?: boolean
+    fullPage?: boolean
+  } = {},
+): Promise<{ buf: Buffer; meta: any; clip: any }> {
+  const payload: Record<string, unknown> = { tabId, mode: 'cdp' }
+  if (opts.clip) payload.clip = { ...opts.clip, scale: opts.clip.scale ?? 1 }
+  if (opts.selector) payload.selector = opts.selector
+  if (Number.isInteger(opts.selectorIndex)) payload.selectorIndex = opts.selectorIndex
+  if (opts.padding) payload.padding = opts.padding
+  if (opts.captureBeyondViewport !== false) payload.captureBeyondViewport = true
+  if (opts.reload) payload.reload = true
+  if (typeof opts.waitMs === 'number') payload.waitMs = opts.waitMs
+  if (opts.restoreActive === false) payload.restoreActive = false
+  if (opts.fullPage) payload.fullPage = true
+  const result = await requestCommand('screenshot', payload, timeoutMs)
+  const dataUrl = typeof result.dataUrl === 'string' ? result.dataUrl : ''
+  if (!dataUrl) throw new Error('Extension did not return screenshot data (cdp)')
+  return {
+    buf: decodeImageDataUrl(dataUrl),
+    meta: (result as any).cdpMeta ?? null,
+    clip: (result as any).cdpClip ?? null,
+  }
+}
+
+/**
+ * Programmatically scroll the page to a CSS Y offset and wait for layout to settle.
+ */
+async function scrollPageTo(tabId: number, scrollY: number, timeoutMs: number): Promise<{ scrollY: number; dpr: number; viewport: { width: number; height: number } }> {
+  const expression = `(function(){
+    window.scrollTo(0, ${Math.max(0, Math.round(scrollY))});
+    return { scrollY: window.scrollY, dpr: window.devicePixelRatio || 1, viewport: { width: window.innerWidth, height: window.innerHeight } };
+  })()`
+  const result = await requestCommand('eval', { expression, tabId }, timeoutMs)
+  return result.value as any
+}
+
+/**
+ * Stitch multiple captureVisibleTab PNGs into a single tall image. Each segment is
+ * pasted at its physical Y offset (scrollY * dpr). Overlapping rows are overwritten
+ * by the later segment, which keeps things simple and works as long as we paste in
+ * scroll order.
+ */
+async function stitchSegments(
+  segments: Array<{ buf: Buffer; physicalY: number }>,
+  totalHeight: number,
+): Promise<Buffer> {
+  const { PNG } = await import('pngjs')
+  if (!segments.length) throw new Error('No segments to stitch')
+  // Decode first to learn width
+  const first = PNG.sync.read(segments[0].buf)
+  const width = first.width
+  const dst = new PNG({ width, height: Math.ceil(totalHeight) })
+
+  for (const seg of segments) {
+    const png = seg === segments[0] ? first : PNG.sync.read(seg.buf)
+    const yOffset = Math.round(seg.physicalY)
+    const drawHeight = Math.min(png.height, dst.height - yOffset)
+    if (drawHeight <= 0) continue
+    const drawWidth = Math.min(png.width, width)
+    for (let row = 0; row < drawHeight; row++) {
+      const srcStart = row * png.width * 4
+      const dstStart = ((yOffset + row) * width) * 4
+      png.data.copy(dst.data, dstStart, srcStart, srcStart + drawWidth * 4)
+    }
+  }
+  return PNG.sync.write(dst)
+}
+
+async function screenshotTab(
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  options: ScreenshotOptions = {},
+): Promise<JsonRecord> {
+  // Mode matrix (v0.7.1):
+  //   "dom"     — html2canvas-based DOM→image render (default when selector is
+  //               provided). Works on background tabs, doesn't switch focus,
+  //               no paint-layer issues, no stitching. REQUIRES the element to
+  //               be reachable from the current DOM.
+  //   "visible" — captureVisibleTab + scroll/stitch. Briefly focuses the tab.
+  //   "cdp"     — chrome.debugger Page.captureScreenshot. Works in background
+  //               but some GPU-composited layers (X.com avatars) render black.
+  const { tabId, saveTo, selector, index, padding, rect, restoreActive = true, reload, waitMs, evalBefore } = options
+  const mode = options.mode ?? (selector ? 'dom' : 'visible')
+
+  // ----- DOM render path (html2canvas) -----
+  if (mode === 'dom') {
+    if (typeof tabId !== 'number') throw new Error('dom mode requires tabId')
+    if (!selector) throw new Error('dom mode requires selector')
+    const payload: Record<string, unknown> = {
+      tabId,
+      mode: 'dom',
+      selector,
+    }
+    if (Number.isInteger(index)) payload.selectorIndex = index
+    if (padding !== undefined) payload.padding = padding
+    if (options.backgroundColor !== undefined) payload.backgroundColor = options.backgroundColor
+    if (typeof options.scale === 'number') payload.scale = options.scale
+    const result = await requestCommand('screenshot', payload, timeoutMs)
+    const dataUrl = typeof result.dataUrl === 'string' ? result.dataUrl : ''
+    if (!dataUrl) throw new Error('dom render: no dataUrl returned')
+    const filePath = resolveScreenshotPath(saveTo, tabId)
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(filePath, decodeImageDataUrl(dataUrl))
+    return {
+      ok: true,
+      via: 'extension-command-queue',
+      tabId,
+      savedTo: filePath,
+      mode: 'dom',
+      meta: (result as any).domMeta ?? null,
+    }
+  }
+
+  // Simple path: no selector / rect → just full screenshot (CDP or visible)
+  if (!selector && !rect) {
+    if (mode === 'cdp') {
+      if (typeof tabId !== 'number') throw new Error('cdp mode requires tabId')
+      const { buf } = await captureViaCdp(tabId, timeoutMs, {
+        captureBeyondViewport: true,
+        reload,
+        waitMs,
+        restoreActive: (options as any).restoreActive !== false,
+      })
+      const filePath = resolveScreenshotPath(saveTo, tabId)
+      mkdirSync(dirname(filePath), { recursive: true })
+      writeFileSync(filePath, buf)
+      return { ok: true, via: 'extension-command-queue', tabId, savedTo: filePath, mode: 'cdp' }
+    }
+    const buf = await captureVisibleTabBuffer(tabId, timeoutMs, restoreActive ? { restoreActive: true } : {})
+    const filePath = resolveScreenshotPath(saveTo, tabId)
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(filePath, buf)
+    return {
+      ok: true,
+      via: 'extension-command-queue',
+      tabId: tabId ?? null,
+      savedTo: filePath,
+      mode: 'visible',
+    }
+  }
+
+  if (typeof tabId !== 'number') throw new Error('selector/rect cropping requires tabId')
+
+  const pad = normalizePadding(padding)
+
+  // ----- CDP path: delegate measurement + capture to extension in one attach session -----
+  // This avoids cross-context DOM races (e.g. virtualized lists where chrome.scripting
+  // eval and Page.captureScreenshot would see different snapshots).
+  //
+  // Strategy: ask the extension to (a) optionally reload + wait, (b) measure the
+  // selector inside the same chrome.debugger session, (c) capture the FULL page
+  // beyond viewport (no clip — clip semantics with captureBeyondViewport are
+  // unreliable for elements positioned at the very top of the viewport on some
+  // sites). Then crop the result with pngjs using the measured rect, which is
+  // guaranteed correct because measurement and capture see identical DOM.
+  if (mode === 'cdp') {
+    // Puppeteer-style: let CDP Page.captureScreenshot produce the clipped
+    // element image directly. The extension briefly foregrounds the target
+    // tab, measures the selector, runs captureScreenshot with clip, then
+    // restores the original active tab.
+    const cdpOpts: any = {
+      captureBeyondViewport: true,
+      padding: { top: pad.top, right: pad.right, bottom: pad.bottom, left: pad.left },
+      restoreActive: (options as any).restoreActive !== false,
+    }
+    if (selector) {
+      cdpOpts.selector = selector
+      if (Number.isInteger(index)) cdpOpts.selectorIndex = index
+    } else if (rect) {
+      const r = normalizeRectInput(rect)
+      if (!r) throw new Error('Invalid rect')
+      cdpOpts.clip = { x: r.x - pad.left, y: r.y - pad.top, width: r.width + pad.left + pad.right, height: r.height + pad.top + pad.bottom, scale: 1 }
+    }
+    if (reload) cdpOpts.reload = true
+    if (typeof waitMs === 'number') cdpOpts.waitMs = waitMs
+
+    const { buf, meta, clip } = await captureViaCdp(tabId, timeoutMs, cdpOpts)
+    const filePath = resolveScreenshotPath(saveTo, tabId)
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(filePath, buf)
+    const { PNG } = await import('pngjs')
+    const png = PNG.sync.read(buf)
+    return {
+      ok: true,
+      via: 'extension-command-queue',
+      tabId,
+      savedTo: filePath,
+      mode: 'cdp',
+      cropRect: { x: Math.round((clip?.x ?? 0) * (meta?.dpr ?? 1)), y: Math.round((clip?.y ?? 0) * (meta?.dpr ?? 1)), width: png.width, height: png.height, dpr: meta?.dpr ?? 1 },
+      meta,
+    }
+  }
+
+  // ----- Visible path: bridge measures via chrome.scripting eval, then scroll-and-stitch -----
+  // Step 1: locate target rect in absolute document coordinates
+  let absRect: { x: number; y: number; width: number; height: number }
+  let dpr: number
+  let viewport: { width: number; height: number }
+  let pageWidth: number
+  let pageHeight: number
+
+  if (selector) {
+    const expression = `(function(){
+      var nodes = document.querySelectorAll(${JSON.stringify(selector)});
+      if (!nodes.length) throw new Error('No element matches selector: ' + ${JSON.stringify(selector)});
+      var el = nodes[${Number.isInteger(index) ? Number(index) : 0}] || nodes[0];
+      el.scrollIntoView({block: 'start', inline: 'start'});
+      var r = el.getBoundingClientRect();
+      return {
+        rect: { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height },
+        dpr: window.devicePixelRatio || 1,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        page: { width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) },
+        scrollY: window.scrollY,
+      };
+    })()`
+    const result = await requestCommand('eval', { expression, tabId }, timeoutMs)
+    const value = result.value as any
+    if (!value || !value.rect) throw new Error('Failed to measure element rect')
+    absRect = value.rect
+    dpr = value.dpr
+    viewport = value.viewport
+    pageWidth = value.page.width
+    pageHeight = value.page.height
+  } else {
+    const r = normalizeRectInput(rect)
+    if (!r) throw new Error('Invalid rect')
+    const info = await getViewportInfoBridge(tabId, timeoutMs)
+    dpr = info.dpr
+    viewport = info.viewport
+    // Treat input rect as absolute document coordinates
+    absRect = r
+    const expression = `(function(){return { width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) }})()`
+    const dim = await requestCommand('eval', { expression, tabId }, timeoutMs)
+    const v = dim.value as any
+    pageWidth = v.width
+    pageHeight = v.height
+  }
+
+  // Apply padding in CSS pixels
+  absRect = {
+    x: absRect.x - pad.left,
+    y: absRect.y - pad.top,
+    width: absRect.width + pad.left + pad.right,
+    height: absRect.height + pad.top + pad.bottom,
+  }
+
+  // ----- Visible path: scroll-and-stitch (note: this WILL switch to the target tab) -----
+  // Step 2: capture in segments by scrolling the viewport across the target
+  const segments: Array<{ buf: Buffer; physicalY: number }> = []
+  const targetTop = Math.max(0, absRect.y)
+  const targetBottom = Math.min(pageHeight, absRect.y + absRect.height)
+  const segmentStep = Math.max(50, viewport.height - 16) // small overlap to avoid gaps
+  let cursor = targetTop
+  let safety = 0
+  const seenY = new Set<number>()
+  let firstSegmentExtra: Record<string, unknown> = {}
+  // Pass restoreActive only on the LAST capture to avoid switching back mid-way.
+  while (cursor < targetBottom && safety < 30) {
+    safety++
+    const scroll = await scrollPageTo(tabId, cursor, timeoutMs)
+    const actualScrollY = scroll.scrollY
+    if (seenY.has(actualScrollY) && segments.length > 0) {
+      break
+    }
+    seenY.add(actualScrollY)
+    await new Promise((r) => setTimeout(r, 280))
+    const buf = await captureVisibleTabBuffer(tabId, timeoutMs, firstSegmentExtra)
+    firstSegmentExtra = {} // already on the right tab after first capture
+    segments.push({ buf, physicalY: actualScrollY * dpr })
+    if (actualScrollY + viewport.height >= targetBottom) break
+    cursor = actualScrollY + segmentStep
+  }
+  if (!segments.length) throw new Error('Failed to capture any segment')
+
+  // Step 3: stitch segments into a full-document slice covering the target band,
+  // then crop to absRect (in physical pixels).
+  const physBottom = (absRect.y + absRect.height) * dpr + 16
+  const stitched = await stitchSegments(segments, physBottom)
+
+  // Step 4: write stitched buffer, then crop in-place
+  const filePath = resolveScreenshotPath(saveTo, tabId)
   mkdirSync(dirname(filePath), { recursive: true })
-  writeFileSync(filePath, decodePngDataUrl(dataUrl))
+  writeFileSync(filePath, stitched)
+
+  const cropped = await cropPngFile(filePath, {
+    x: absRect.x * dpr,
+    y: absRect.y * dpr,
+    width: absRect.width * dpr,
+    height: absRect.height * dpr,
+  })
+
+  // restoreActive: after stitching, ask extension to switch back to whatever
+  // was active before. We do this by selecting the tracked original tab.
+  // (We only know it inside the extension; bridge can't track that here, so we
+  // delegate via a no-op screenshot call with restoreActive=true… simpler:
+  // just expose a separate "selectTab" call to whatever the user remembered.
+  // For now, surface the flag in the response and let the caller handle it.)
 
   return {
     ok: true,
     via: 'extension-command-queue',
-    commandId: result.id,
-    tabId: result.tabId ?? tabId ?? null,
-    windowId: result.windowId ?? null,
+    tabId: tabId,
     savedTo: filePath,
+    cropRect: { ...cropped, dpr },
+    segments: segments.length,
+    mode: 'visible',
+    restoreActiveRequested: restoreActive,
   }
 }
 
@@ -776,13 +1253,34 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return listTabs(body.query as string | undefined, body.limit as number | undefined, body.maxTitleLength as number | undefined, body.timeoutMs)
     case 'selectTab':
       return selectTab(body.tabId, body.timeoutMs)
+    case 'closeTab': {
+      const tabId = normalizeTabId(body.tabId)
+      const result = await requestCommand('closeTabs', { tabIds: [tabId] }, body.timeoutMs)
+      return result
+    }
     case 'closeTabs': {
-      if (!body.tabIds || !Array.isArray(body.tabIds)) throw new Error('Missing tabIds array')
-      const result = await requestCommand('closeTabs', { tabIds: body.tabIds }, body.timeoutMs)
+      const tabIds = normalizeTabIds(body.tabIds)
+      const result = await requestCommand('closeTabs', { tabIds }, body.timeoutMs)
       return result
     }
     case 'screenshot':
-      return screenshotTab(body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined, body.saveTo)
+      return screenshotTab(body.timeoutMs, {
+        tabId: typeof body.tabId === 'number' ? body.tabId : undefined,
+        saveTo: body.saveTo,
+        selector: typeof body.selector === 'string' ? body.selector : undefined,
+        index: typeof body.index === 'number' ? body.index : undefined,
+        padding: body.padding,
+        rect: body.rect,
+        mode: body.mode === 'cdp' || body.mode === 'visible' || body.mode === 'dom' ? body.mode : undefined,
+        restoreActive: body.restoreActive !== false,
+        reload: body.reload === true,
+        waitMs: typeof body.waitMs === 'number' ? body.waitMs : undefined,
+        evalBefore: typeof body.evalBefore === 'string' ? body.evalBefore : undefined,
+        deviceMetrics: body.deviceMetrics ?? undefined,
+        forceImgOpacity: body.forceImgOpacity !== false,
+        backgroundColor: body.backgroundColor,
+        scale: typeof body.scale === 'number' ? body.scale : undefined,
+      })
     case 'eval':
       return evalInPage(body.expression, body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'click':
@@ -793,8 +1291,12 @@ async function handleAction(body: ActionRequest): Promise<JsonRecord> {
       return inputInPage(body.selector, body.value ?? '', body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
     case 'getElements':
       return getElementsInPage(body.selector ?? '*', body.timeoutMs, typeof body.tabId === 'number' ? body.tabId : undefined)
+    case 'reloadExtension': {
+      const result = await requestCommand('reloadExtension', undefined, body.timeoutMs ?? 5000)
+      return { ok: true, via: 'extension-command-queue', commandId: result.id, scheduled: true }
+    }
     default:
-      throw new Error(`Unsupported action: ${String(action)}`)
+      throw new BadRequestError(`Unsupported action: ${String(action)}`)
   }
 }
 
@@ -845,7 +1347,9 @@ const server = Bun.serve({
 
       return json({ ok: false, error: 'Not found' }, 404)
     } catch (error) {
-      return json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 500)
+      const message = error instanceof Error ? error.message : String(error)
+      const status = error instanceof BadRequestError ? error.status : 500
+      return json({ ok: false, error: message }, status)
     }
   },
 })

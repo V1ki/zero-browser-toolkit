@@ -164,7 +164,47 @@ async function selectTab(tabId) {
 }
 
 async function captureTabScreenshot(payload) {
+  // mode: "visible" (default) — captureVisibleTab, requires tab to become active
+  // mode: "cdp"               — chrome.debugger Page.captureScreenshot, works on
+  //                              non-active and even non-foreground tabs without
+  //                              changing the user's active selection.
+  // restoreActive: when true (and we had to switch tabs), restore the previous
+  //                active tab when done.
+  const mode = payload?.mode === 'cdp' ? 'cdp' : 'visible'
+  const restoreActive = payload?.restoreActive === true
+
+  // Remember the originally active tab so we can restore it if needed.
+  let originalActive = null
+  if (restoreActive || mode === 'cdp') {
+    try {
+      const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+      if (active?.id) originalActive = { id: active.id, windowId: active.windowId }
+    } catch (_) { /* ignore */ }
+  }
+
   let tab
+  if (mode === 'cdp') {
+    // CDP path: do NOT switch tabs. Just resolve target tab.
+    if (payload?.tabId !== undefined) {
+      tab = await chrome.tabs.get(Number(payload.tabId))
+      if (!tab?.id) throw new Error(`Tab not found: ${payload.tabId}`)
+    } else {
+      tab = await getActiveTab()
+    }
+    const cdp = await captureViaDebugger(tab.id, payload)
+    return {
+      tabId: tab.id,
+      windowId: tab.windowId,
+      title: tab.title ?? '',
+      url: tab.url ?? '',
+      dataUrl: cdp.dataUrl,
+      meta: cdp.meta,
+      clip: cdp.clip,
+      mode: 'cdp',
+    }
+  }
+
+  // Visible path (default)
   if (payload?.tabId !== undefined) {
     const selected = await selectTab(payload.tabId)
     tab = await chrome.tabs.get(selected.id)
@@ -175,13 +215,349 @@ async function captureTabScreenshot(payload) {
 
   if (typeof tab?.windowId !== 'number') throw new Error('Unable to determine target window for screenshot')
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
+
+  // Restore original tab if requested
+  if (restoreActive && originalActive && originalActive.id !== tab.id) {
+    try {
+      await chrome.tabs.update(originalActive.id, { active: true })
+    } catch (_) { /* tab may have been closed */ }
+  }
+
   return {
     tabId: tab.id,
     windowId: tab.windowId,
     title: tab.title ?? '',
     url: tab.url ?? '',
     dataUrl,
+    mode: 'visible',
+    restoredActive: restoreActive && originalActive ? originalActive.id : null,
   }
+}
+
+/**
+ * Element screenshot via Chrome DevTools Protocol (Puppeteer-style).
+ *
+ * Flow (mirrors ElementHandle.screenshot() in Puppeteer/Playwright):
+ *   1. Briefly make the tab foreground-active so Chrome actually paints it
+ *      (remember the previous active tab so we can restore).
+ *   2. Attach chrome.debugger.
+ *   3. Measure the element rect in page coordinates (scroll into view first).
+ *   4. Page.captureScreenshot with {clip, captureBeyondViewport:true}.
+ *   5. Detach.
+ *   6. Restore the original active tab so the user sees no visible switch
+ *      (a short blip in the tab bar is unavoidable; like Puppeteer's
+ *       `bringToFront`).
+ *
+ * No CSS hacks. No DOM mutations. No deviceMetrics override. The clip is
+ * Chrome's native element bounding rect and Chrome paints the element with
+ * its normal pipeline — exactly what the user would see if they switched to
+ * that tab themselves.
+ */
+/**
+ * Element-screenshot via DOM-to-image rendering (html2canvas).
+ *
+ * This is the iOS/Android "render view to bitmap" equivalent: we walk the
+ * target element's DOM, read computed styles, fetch any referenced images
+ * (CORS permitting) and rasterize them to a canvas. It completely bypasses
+ * the screen compositor, so it works on background/inactive tabs and is
+ * unaffected by CDP paint-layer issues.
+ *
+ * Required payload:
+ *   tabId: number
+ *   selector: string
+ * Optional:
+ *   selectorIndex: number    (default 0)
+ *   padding: number|object   (extra CSS px around the element)
+ *   backgroundColor: string|null  (html2canvas option, default null = transparent)
+ *   scale: number            (default devicePixelRatio)
+ */
+async function captureElementViaDomRender(payload) {
+  const tabId = Number(payload?.tabId)
+  if (!Number.isInteger(tabId) || tabId <= 0) throw new Error('dom render requires tabId')
+  const selector = typeof payload?.selector === 'string' ? payload.selector : null
+  if (!selector) throw new Error('dom render requires selector')
+  const selectorIndex = Number.isInteger(payload?.selectorIndex) ? Number(payload.selectorIndex) : 0
+  const padding = payload?.padding ?? 0
+  const backgroundColor = payload?.backgroundColor ?? null
+  const scaleHint = typeof payload?.scale === 'number' ? payload.scale : null
+
+  // Resolve target tab (DO NOT activate / switch)
+  const tab = await chrome.tabs.get(tabId)
+  if (!tab?.id) throw new Error(`Tab not found: ${tabId}`)
+
+  // Step 1: inject html-to-image into the MAIN world of the target tab.
+  // MAIN world is required because the library walks the real page DOM.
+  // html-to-image uses SVG <foreignObject> which delegates rendering back
+  // to the browser's native engine — it handles nested position:absolute,
+  // padding-bottom:100% boxes, CSS transforms etc. correctly (html2canvas
+  // does its own layout simulation and gets these wrong on X.com).
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: 'MAIN',
+    files: ['html-to-image.js'],
+  })
+
+  // Step 2: call html2canvas(el, opts) and return a PNG data URL via message.
+  // We use chrome.scripting.executeScript with an async function that returns
+  // a JSON-serializable object. Data URLs can be large — we rely on MV3
+  // allowing large serialized strings back from executeScript.
+  const args = [{ selector, selectorIndex, padding, backgroundColor, scaleHint }]
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: 'MAIN',
+    args,
+    func: async (opts) => {
+      const { selector, selectorIndex, padding, backgroundColor, scaleHint } = opts
+      const nodes = document.querySelectorAll(selector)
+      if (!nodes.length) return { ok: false, error: 'No element matches selector: ' + selector }
+      const el = nodes[selectorIndex] || nodes[0]
+      try { el.scrollIntoView({ block: 'start', inline: 'start' }) } catch (_) {}
+      // Let layout settle
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+
+      // Wait briefly for any images inside the element to finish loading
+      const imgs = el.querySelectorAll('img')
+      const pendingImgs = []
+      for (const img of imgs) {
+        if (img.complete && img.naturalWidth > 0) continue
+        pendingImgs.push(new Promise(resolve => {
+          const done = () => resolve()
+          img.addEventListener('load', done, { once: true })
+          img.addEventListener('error', done, { once: true })
+          setTimeout(done, 3000)
+        }))
+      }
+      if (pendingImgs.length) await Promise.race([
+        Promise.all(pendingImgs),
+        new Promise(r => setTimeout(r, 4000)),
+      ])
+
+      // html-to-image attaches itself to window.htmlToImage
+      const h2i = window.htmlToImage
+      if (!h2i || typeof h2i.toPng !== 'function') {
+        return { ok: false, error: 'html-to-image not injected' }
+      }
+
+      let pad = { top: 0, right: 0, bottom: 0, left: 0 }
+      if (typeof padding === 'number') pad = { top: padding, right: padding, bottom: padding, left: padding }
+      else if (padding && typeof padding === 'object') {
+        pad = {
+          top: Number(padding.top ?? padding.y ?? 0) || 0,
+          right: Number(padding.right ?? padding.x ?? 0) || 0,
+          bottom: Number(padding.bottom ?? padding.y ?? 0) || 0,
+          left: Number(padding.left ?? padding.x ?? 0) || 0,
+        }
+      }
+
+      const rect = el.getBoundingClientRect()
+      const scale = scaleHint || window.devicePixelRatio || 1
+
+      // Render the element itself (no cloning/wrapping — X's React-generated
+      // CSS classes live in the page's stylesheet and won't apply to a clone
+      // that's detached from the hydrated tree). Padding is added to the
+      // final canvas after we draw the element image.
+      try {
+        const opts = {
+          pixelRatio: scale,
+          skipFonts: false,
+        }
+        // html-to-image respects the `backgroundColor` option as the canvas fill
+        if (backgroundColor != null) opts.backgroundColor = backgroundColor
+        const elDataUrl = await h2i.toPng(el, opts)
+
+        // Load the generated image back and composite onto a padded canvas.
+        const img = new Image()
+        img.src = elDataUrl
+        await new Promise((resolve, reject) => {
+          img.onload = () => resolve()
+          img.onerror = () => reject(new Error('failed to load generated image back'))
+        })
+
+        const outW = Math.round((rect.width + pad.left + pad.right) * scale)
+        const outH = Math.round((rect.height + pad.top + pad.bottom) * scale)
+        const canvas = document.createElement('canvas')
+        canvas.width = outW
+        canvas.height = outH
+        const ctx = canvas.getContext('2d')
+        if (backgroundColor != null) {
+          ctx.fillStyle = backgroundColor
+          ctx.fillRect(0, 0, outW, outH)
+        }
+        ctx.drawImage(img, Math.round(pad.left * scale), Math.round(pad.top * scale))
+        const dataUrl = canvas.toDataURL('image/png')
+
+        return {
+          ok: true,
+          dataUrl,
+          meta: {
+            rect: { x: rect.left + window.scrollX, y: rect.top + window.scrollY, width: rect.width, height: rect.height },
+            canvas: { width: outW, height: outH },
+            scale,
+            viewport: { width: window.innerWidth, height: window.innerHeight },
+          },
+        }
+      } catch (e) {
+        return { ok: false, error: 'html-to-image failed: ' + (e && e.message ? e.message : String(e)) }
+      }
+    },
+  })
+
+  const r = results && results[0] && results[0].result
+  if (!r) throw new Error('dom render: no result')
+  if (!r.ok) throw new Error(r.error || 'dom render failed')
+  return {
+    tabId: tab.id,
+    windowId: tab.windowId,
+    title: tab.title ?? '',
+    url: tab.url ?? '',
+    dataUrl: r.dataUrl,
+    meta: r.meta,
+  }
+}
+
+async function captureViaDebugger(tabId, payload) {
+  const target = { tabId }
+  const format = payload?.format === 'jpeg' ? 'jpeg' : 'png'
+  const quality = typeof payload?.quality === 'number' ? payload.quality : undefined
+  const selector = typeof payload?.selector === 'string' ? payload.selector : null
+  const selectorIndex = Number.isInteger(payload?.selectorIndex) ? Number(payload.selectorIndex) : 0
+  const padding = normalizePaddingPayload(payload?.padding)
+  const restoreActive = payload?.restoreActive !== false // default true
+  const reload = payload?.reload === true
+  const waitMs = Number.isFinite(payload?.waitMs) ? Number(payload.waitMs) : 0
+  const explicitClip = payload?.clip && typeof payload.clip === 'object' ? payload.clip : null
+  const fullPage = payload?.fullPage === true
+
+  // Remember the original active tab so we can restore focus at the end.
+  let originalActive = null
+  try {
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    if (active?.id && active.id !== tabId) originalActive = { id: active.id, windowId: active.windowId }
+  } catch (_) {}
+
+  // Bring the target tab to the foreground so the browser actually runs its
+  // paint pipeline for it. Without this, Chrome throttles background tabs
+  // and captureScreenshot can return stale / placeholder frames.
+  let targetTab
+  try {
+    targetTab = await chrome.tabs.get(tabId)
+    if (!targetTab?.id) throw new Error(`Tab not found: ${tabId}`)
+    await chrome.tabs.update(tabId, { active: true })
+    if (targetTab.windowId !== undefined) {
+      try { await chrome.windows.update(targetTab.windowId, { focused: true }) } catch (_) {}
+    }
+  } catch (e) {
+    throw new Error(`Failed to focus target tab: ${e && e.message ? e.message : e}`)
+  }
+
+  // Detach any stale debugger session first.
+  try { await chrome.debugger.detach(target) } catch (_) {}
+  await chrome.debugger.attach(target, '1.3')
+
+  try {
+    await chrome.debugger.sendCommand(target, 'Page.enable', {})
+
+    if (reload) {
+      const loadDone = new Promise((resolve) => {
+        const listener = (src, method) => {
+          if (src.tabId === tabId && method === 'Page.loadEventFired') {
+            chrome.debugger.onEvent.removeListener(listener)
+            resolve()
+          }
+        }
+        chrome.debugger.onEvent.addListener(listener)
+        setTimeout(() => { chrome.debugger.onEvent.removeListener(listener); resolve() }, 15000)
+      })
+      await chrome.debugger.sendCommand(target, 'Page.reload', { ignoreCache: false })
+      await loadDone
+    }
+
+    // Give the page a beat to finish initial paint after focus/reload.
+    if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs))
+    else await new Promise((r) => setTimeout(r, 400))
+
+    // Measure + scrollIntoView in the same sync eval so clip coords match.
+    let clip = explicitClip
+    let measuredMeta = null
+    if (selector) {
+      const expr = `(function(){
+        var SEL = ${JSON.stringify(selector)};
+        var IDX = ${selectorIndex};
+        var nodes = document.querySelectorAll(SEL);
+        if (!nodes.length) throw new Error('No element matches selector: ' + SEL);
+        var el = nodes[IDX] || nodes[0];
+        try { window.scrollTo(0, 0); } catch(_) {}
+        try { el.scrollIntoView({block:'start', inline:'start'}); } catch(_) {}
+        var r = el.getBoundingClientRect();
+        return JSON.stringify({
+          rect: { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height },
+          dpr: window.devicePixelRatio || 1,
+          viewport: { width: window.innerWidth, height: window.innerHeight },
+          page: { width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) },
+        });
+      })()`
+      const evalResult = await Promise.race([
+        chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+          expression: expr,
+          returnByValue: true,
+          timeout: 8000,
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('measurement_timeout_10s')), 10000)),
+      ])
+      if (!evalResult || !evalResult.result || typeof evalResult.result.value !== 'string') {
+        throw new Error('CDP measurement failed: ' + JSON.stringify(evalResult?.exceptionDetails || evalResult))
+      }
+      const meta = JSON.parse(evalResult.result.value)
+      measuredMeta = meta
+      if (!fullPage) {
+        clip = {
+          x: meta.rect.x - padding.left,
+          y: meta.rect.y - padding.top,
+          width: meta.rect.width + padding.left + padding.right,
+          height: meta.rect.height + padding.top + padding.bottom,
+          scale: 1,
+        }
+      }
+      // After scrollIntoView: let Chrome finish layout + paint (2 frames + a breath)
+      await new Promise((r) => setTimeout(r, 300))
+    }
+
+    const params = { format, captureBeyondViewport: true }
+    if (format === 'jpeg' && typeof quality === 'number') params.quality = quality
+    if (clip && !fullPage) params.clip = clip
+    const result = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', params)
+    if (!result || typeof result.data !== 'string') throw new Error('Page.captureScreenshot returned no data')
+    return {
+      dataUrl: `data:image/${format};base64,${result.data}`,
+      meta: measuredMeta,
+      clip,
+    }
+  } finally {
+    try { await chrome.debugger.detach(target) } catch (_) {}
+    // Restore original active tab so the user doesn't see a lingering tab switch.
+    if (restoreActive && originalActive && originalActive.id !== tabId) {
+      try { await chrome.tabs.update(originalActive.id, { active: true }) } catch (_) {}
+      if (originalActive.windowId !== undefined) {
+        try { await chrome.windows.update(originalActive.windowId, { focused: true }) } catch (_) {}
+      }
+    }
+  }
+}
+
+function normalizePaddingPayload(value) {
+  if (value == null) return { top: 0, right: 0, bottom: 0, left: 0 }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return { top: value, right: value, bottom: value, left: value }
+  }
+  if (typeof value === 'object') {
+    return {
+      top: Number(value.top ?? value.y ?? 0) || 0,
+      right: Number(value.right ?? value.x ?? 0) || 0,
+      bottom: Number(value.bottom ?? value.y ?? 0) || 0,
+      left: Number(value.left ?? value.x ?? 0) || 0,
+    }
+  }
+  return { top: 0, right: 0, bottom: 0, left: 0 }
 }
 
 async function runEvalInWorld(tabId, source, world) {
@@ -520,6 +896,28 @@ async function executeCommand(command) {
     }
 
     case 'screenshot': {
+      // If selector is provided and mode is "dom" (default for selector-based),
+      // use the html2canvas-based DOM-to-image renderer which walks the DOM,
+      // reads computed styles, and rasterizes the element tree. This works
+      // on background tabs, doesn't need to focus the tab, and doesn't suffer
+      // from the CDP paint-layer loss that affects X.com avatars.
+      const p = command.payload
+      const wantsDomRender = p && p.mode === 'dom' && typeof p.selector === 'string'
+      if (wantsDomRender) {
+        const shot = await captureElementViaDomRender(p)
+        return {
+          id: command.id,
+          ok: true,
+          type: command.type,
+          tabId: shot.tabId,
+          windowId: shot.windowId,
+          title: shot.title,
+          url: shot.url,
+          dataUrl: shot.dataUrl,
+          mode: 'dom',
+          domMeta: shot.meta ?? null,
+        }
+      }
       const screenshot = await captureTabScreenshot(command.payload)
       return {
         id: command.id,
@@ -530,7 +928,16 @@ async function executeCommand(command) {
         title: screenshot.title,
         url: screenshot.url,
         dataUrl: screenshot.dataUrl,
+        mode: screenshot.mode ?? null,
+        cdpMeta: screenshot.meta ?? null,
+        cdpClip: screenshot.clip ?? null,
       }
+    }
+
+    case 'reloadExtension': {
+      // Schedule a self-reload after returning the result so the bridge sees ok.
+      setTimeout(() => { try { chrome.runtime.reload() } catch (_) {} }, 200)
+      return { id: command.id, ok: true, type: command.type, scheduled: true }
     }
 
     case 'eval': {
